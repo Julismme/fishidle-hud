@@ -2,7 +2,7 @@
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
 // @version      1.0.0
-// @description  fishidle.com 的辅助面板：活动 / 队列完成时间、技能升级预估、死亡告警、保持活跃、收藏快捷启动、发育计算器（七职业，T1–T7）、画中画置顶小窗；可在游戏设置页按模块开关。
+// @description  fishidle.com 辅助面板：队列倒计时、升级预估、死亡告警、收藏、发育计算器。
 // @match        https://fishidle.com/game/*
 // @run-at       document-start
 // @grant        none
@@ -10,14 +10,12 @@
 // @updateURL    https://raw.githubusercontent.com/julismme/fishidle-hud/main/fishidle-hud.user.js
 // ==/UserScript==
 
-// 页面上下文（@grant none），经 Vue 公开 API __vue_app__ 读取 Pinia 响应式状态。
 (() => {
   "use strict";
   const VERSION = "1.0.0";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
-  // ---------- Pinia 接入 ----------
   function getPiniaStore(id) {
     const app = document.querySelector("#app")?.__vue_app__;
     return app?.config?.globalProperties?.$pinia?._s?.get(id) ?? null;
@@ -26,39 +24,32 @@
     return getPiniaStore("game");
   }
 
-  // ---------- CraftTick 观察：包装 store 方法，纯透传零改动 ----------
-  // 经验值客户端无静态来源（store/profile 均无），唯一来源是 CraftTick 事件；
-  // 持久化到 localStorage 使数据跨刷新保留，避免"本次会话未生产过"提示。
   const CRAFT_XP_LS = "fishidle-hud.craftXp";
-  const craftXp = new Map(); // profession -> {lv, xp, next, at}
-  try { // 启动时恢复上次已知经验（经验只随生产变化，last-write-wins 安全）
+  const craftXp = new Map();
+  try {
     for (const [k, v] of JSON.parse(localStorage.getItem(CRAFT_XP_LS) || "[]")) craftXp.set(k, v);
   } catch {}
   function persistCraftXp() {
     try { localStorage.setItem(CRAFT_XP_LS, JSON.stringify([...craftXp])); } catch {}
   }
-  // 采集经验采样：ActivityTick 只带累积 currentXp（无单次经验），包装 applyTick 取相邻差值
-  // 推导"每次采集经验/实测 tick 间隔"，按 (skillType, resourceId) 记忆并持久化
   const GATHER_XP_LS = "fishidle-hud.gatherXp";
-  const gatherXp = new Map(); // "skillType|resourceId" -> {skillType, resourceId, prevXp, per, tick, at}
+  const gatherXp = new Map();
   try {
     for (const [k, v] of JSON.parse(localStorage.getItem(GATHER_XP_LS) || "[]")) gatherXp.set(k, v);
   } catch {}
   function persistGatherXp() {
     try { localStorage.setItem(GATHER_XP_LS, JSON.stringify([...gatherXp])); } catch {}
   }
-  // 采集数值公式（逆向自 game store 数值模块，默认参数；服务器 catalog 可覆盖 xpPerTier 等——
-  // 故采样值存在时优先采样，公式值兜底）
   const GATHER_CFG = { minIv: 2, maxIv: 25, maxLv: 200, maxSpd: 1.5, toolSpd: 0.06,
     xpPerTier: [10, 22, 42, 75, 130, 210, 330], tierLvCoef: 29, slope: 0.04, exp: 2.3, minPen: 0.001 };
-  function gatherXpPer(tier, level) { // 单次经验（等级超过 tier×29 后指数衰减）
+  function gatherXpPer(tier, level) {
     const base = GATHER_CFG.xpPerTier[Math.max(0, Math.min((tier ?? 1) - 1, GATHER_CFG.xpPerTier.length - 1))] ?? 0;
     const over = level - (tier ?? 1) * GATHER_CFG.tierLvCoef;
     if (over <= 0) return base;
     const pen = Math.max(1 / (1 + over * GATHER_CFG.slope) ** GATHER_CFG.exp, GATHER_CFG.minPen);
     return Math.max(1, Math.round(base * pen));
   }
-  function gatherInterval(tier, level, toolTier) { // 单次间隔：tier 对数插值 ÷ 等级速度 ÷ 工具加成
+  function gatherInterval(tier, level, toolTier) {
     const t = (Math.max(1, Math.min(tier ?? 1, 7)) - 1) / 6;
     const base = GATHER_CFG.minIv * (GATHER_CFG.maxIv / GATHER_CFG.minIv) ** t;
     const spd = GATHER_CFG.maxLv <= 1 ? GATHER_CFG.maxSpd
@@ -69,7 +60,7 @@
   const gatherToolTier = (g, st) =>
     (g?.equippedTools ?? []).find((t) => t.gatheringSkill === st && t.toolId != null)?.toolTier ?? 0;
   let storeHooked = false;
-  function parseCraftTick(p, prof) { // 纯函数，便于测试
+  function parseCraftTick(p, prof) {
     if (!p || typeof p !== "object" || !prof) return null;
     const lv = p.currentLevel ?? p.level, xp = p.currentXp ?? p.experience,
           next = p.nextLevelExp ?? p.nextLevelXp;
@@ -77,10 +68,8 @@
     return { prof, lv: Number.isFinite(lv) ? lv : null, xp, next, at: Date.now() };
   }
   function hookStore(g) {
-    if (storeHooked || !g) return; // 门槛=拿到 store；各包装按存在性单独判断（防游戏改版后轮询永不停止）
+    if (storeHooked || !g) return;
     try {
-      // PlayerState 事件（游戏启动/重连/目录失效时下发）payload 含全量 craftingSkills，
-      // 组件直接用它初始化 craftSkills ref——在这层拦截即可零解码获得初始经验
       const origPS = g.applyPlayerState;
       if (typeof origPS === "function") {
         g.applyPlayerState = function (p) {
@@ -107,7 +96,6 @@
           return orig.apply(this, arguments);
         };
       }
-      // 炼金同形 tick（payload 同 CraftTick）；currentActivity 残留字段不可信，按 type/alchemyItemId 判定
       if (typeof g.applyAlchemyTick === "function") {
         const origAl = g.applyAlchemyTick;
         g.applyAlchemyTick = function (p) {
@@ -120,7 +108,7 @@
       }
       const origAT = g.applyTick;
       if (typeof origAT === "function") {
-        g.applyTick = function (p) { // 采集/生产共用的 ActivityTick：纯透传
+        g.applyTick = function (p) {
           try {
             const cur = g.currentActivity;
             const st = cur?.skillType, rid = cur?.resourceId;
@@ -138,18 +126,13 @@
         };
       }
       storeHooked = true;
-      hookProbe(g); // Pinia $subscribe：状态变更（含 combatState 死亡写入）→ 事件驱动探测
+      hookProbe(g);
     } catch {}
   }
-  // 快速挂钩轮询：store 一创建就包装（100ms 粒度，赶在任何网络事件之前）
   const hookTimer = setInterval(() => {
     if (storeHooked) { clearInterval(hookTimer); return; }
     hookStore(getGameStore());
   }, 100);
-  // 生产活动材料感知：配方消耗 × 背包库存 → 实际剩余次数（纯函数，便于测试）
-  // 注意：currentActivity/队列条目是联合对象，切换后旧字段残留（实测强化条目带残留
-  // skillType:"Mining"）——判别必须用专用字段/类型标识，不能信 skillType/craftingProfession：
-  // 强化（enhancementTargetItemId）> 炼金（alchemyItemId）> 采集（resourceId/locationId）> 制造（craftingRecipeId）
   function isEnhancementActivity(a) {
     return !!a && (a.enhancementTargetItemId != null || a.type === "Enhancement" || a.activityType === "Enhancement");
   }
@@ -161,7 +144,7 @@
   }
   function activityLabel(e, g) {
     if (!e) return "当前活动";
-    if (e.type === "Combat") { // 队列战斗条目：combatZoneId 查地图名（type 为服务器权威标识，不受残留干扰）
+    if (e.type === "Combat") {
       const z = (g?.combatZones ?? []).find((x) => x.id === e.combatZoneId);
       return "战斗·" + (z?.name ?? `#${e.combatZoneId ?? "?"}`);
     }
@@ -182,12 +165,10 @@
     const mats = (r.ingredients ?? []).map((i) => ({
       name: i.name ?? `#${i.itemId}`, per: i.quantity || 1, have: inv.get(i.itemId) ?? 0 }));
     const possible = mats.length
-      ? Math.min(...mats.map((m) => Math.floor(m.have / m.per))) : Infinity; // 背包还能支撑的次数
-    // 计划次数：队列/静止条目用 remainingCount；运行中活动计数迁移到 remainingTicks（1 craft = 1 tick）
-    // 均缺失 = 无限档（料尽为止）。材料可支撑次数只作上限：min(计划, 材料) —— 队列限制优先。
+      ? Math.min(...mats.map((m) => Math.floor(m.have / m.per))) : Infinity;
     const plannedRaw = Number.isFinite(cur.remainingCount) ? cur.remainingCount
       : (Number.isFinite(cur.remainingTicks) ? cur.remainingTicks : null);
-    const planned = plannedRaw === 0 ? Infinity : plannedRaw; // 0 = 官方"无限"语义
+    const planned = plannedRaw === 0 ? Infinity : plannedRaw;
     const actual = Math.max(0, Math.min(planned ?? possible, possible));
     return { r, timePerCraft, mats, possible, planned: plannedRaw, actual,
       short: Number.isFinite(planned) && possible < planned,
@@ -209,11 +190,9 @@
     return `${fmtDur(sec)}（约 ${String(end.getHours()).padStart(2, "0")}:${String(end.getMinutes()).padStart(2, "0")}）`;
   };
 
-  // ---------- ETA：精确 tick → 配方/物资感知估算 → 次数×间隔估算 ----------
-  // ctx: { skillTick: Map<type, sec>, recipes: Map<id, recipe>, inv: Map<itemId, qty>, nowMs }
   function tickEta(e, ctx) {
     if (e == null) return null;
-    if (Number.isFinite(e.remainingTicks)) { // 精确：客户端 _i() 同款公式
+    if (Number.isFinite(e.remainingTicks)) {
       const t = e.tickIntervalSeconds ?? e.fallbackIntervalSeconds ?? 5;
       const w = e.tickWindow;
       const curLeft = (w && w.durationMs > 0
@@ -221,29 +200,27 @@
         : Math.min(t, Math.max(0, (new Date(e.nextTickAt).getTime() - ctx.nowMs) / 1000)));
       return { sec: curLeft + Math.max(0, e.remainingTicks - 1) * t, est: false };
     }
-    if (e.remainingCount === 0) return { inf: true }; // 官方语义：0 = 无限
-    if (e.remainingCount == null && e.remainingTicks == null) return { inf: true }; // 运行态无限活动：计数字段缺失
-    if (e.type === "Combat") return null;             // 官方对战斗队列项不算 ETA
-    if (isEnhancementActivity(e) || isAlchemyActivity(e)) return null; // 强化/炼金：无客户端可算的 tick 间隔
+    if (e.remainingCount === 0) return { inf: true };
+    if (e.remainingCount == null && e.remainingTicks == null) return { inf: true };
+    if (e.type === "Combat") return null;
+    if (isEnhancementActivity(e) || isAlchemyActivity(e)) return null;
 
-    // 生产（Crafting）：按背包物资实际可做次数计算，而非队列声明次数
     if (e.type === "Crafting" && e.craftingRecipeId != null) {
       const r = ctx.recipes.get(e.craftingRecipeId);
       if (!r) return null;
       const t = ctx.skillTick.get(e.craftingProfession) ?? r.baseTickIntervalSeconds;
       if (!Number.isFinite(t) || t <= 0) return null;
       const need = Number.isFinite(e.remainingCount) ? e.remainingCount : null;
-      let possible = need; // 无配料信息时退化为队列声明次数
+      let possible = need;
       if (need != null && r.ingredients?.length) {
         possible = Math.min(...r.ingredients.map((i) =>
           Math.floor((ctx.inv.get(i.itemId) ?? 0) / (i.quantity || 1))));
       }
       if (possible == null) return null;
-      if (possible <= 0) return { sec: 0, est: true, short: true }; // 缺料：做不了
+      if (possible <= 0) return { sec: 0, est: true, short: true };
       return { sec: possible * t, est: true, short: need != null && possible < need, possible, need };
     }
 
-    // 采集等：剩余次数 × 技能 tick 间隔
     const ty = e.skillType ?? e.craftingProfession;
     const t = ctx.skillTick.get(ty);
     if (Number.isFinite(e.remainingCount) && e.remainingCount > 0 && Number.isFinite(t) && t > 0)
@@ -258,7 +235,6 @@
     return (eta.est ? "≈ " : "") + txt;
   };
 
-  // ---------- 技能速率（滑动窗口 + EMA 平滑，快速出值） ----------
   const RATE_WINDOW_MS = 300_000, RATE_MIN_SPAN_MS = 6_000, RATE_FRESH_MS = 120_000;
   const series = new Map(), smoothed = new Map();
   function track(key, xp, now) {
@@ -276,7 +252,7 @@
     const raw = (arr[arr.length - 1].xp - arr[0].xp) / dt;
     if (raw <= 0) return null;
     const prev = smoothed.get(key);
-    const sm = prev == null ? raw : prev * 0.7 + raw * 0.3; // EMA 抑制跳变
+    const sm = prev == null ? raw : prev * 0.7 + raw * 0.3;
     smoothed.set(key, sm);
     return { xpPerSec: sm, lastChange: arr[arr.length - 1].t };
   }
@@ -291,7 +267,6 @@
   };
   const zh = (t) => SKILL_ZH[t] ?? t;
 
-  // ---------- 死亡告警（纯函数，便于测试） ----------
   function computeAlert(g, nowMs) {
     const cs = g?.combatState;
     if (!cs) return null;
@@ -302,23 +277,13 @@
     return null;
   }
 
-  // ---------- 保持活跃：只欺骗"上报给服务器的可见性" ----------
-  // 后台静默根因（逆向实证）：游戏监听 visibilitychange，处理器内同步读
-  // document.visibilityState 并调用 hub `SetClientVisibility(visible)`，服务器收到 false 即暂停结算。
-  // v0.10.2 及之前直接全局改写 Document.prototype.hidden/visibilityState —— 游戏在真后台标签页
-  // 也按前台全速运行（战斗特效 ingest/全量重渲染/前台频率定时器全开），而浏览器对隐藏渲染器
-  // 限流降优先级，两者相加 → 主线程分钟级饱和，页面"永远加载不完"（会话恢复的后台标签最易复现）。
-  // 现方案：包装 visibilitychange 监听器的同步执行——仅在这几十微秒内把 document 报为 visible，
-  // 使 SetClientVisibility(true) 照发（服务器照常结算）；浏览器与游戏其余代码（特效 prune 开关、
-  // 启动期 visibilityState==='hidden' 判断等）始终看到真实可见性。document-start 注册包装，
-  // 赶在游戏所有监听器之前。
   const KA_LS = "fishidle-hud.keepalive";
   const keepAlive = {
     on: (() => { try { return localStorage.getItem(KA_LS) === "1"; } catch { return false; } })(),
     installed: false,
   };
-  const wrappedVis = new Map(); // 原始监听器 → 包装版（保证 removeEventListener 仍可移除）
-  function withSpoofedVisibility(fn) { // 瞬态：document 实例级覆盖，finally 删除恢复原型取值器
+  const wrappedVis = new Map();
+  function withSpoofedVisibility(fn) {
     const props = [["hidden", false], ["visibilityState", "visible"]];
     try {
       for (const [p, v] of props) Object.defineProperty(document, p, { get: () => v, configurable: true });
@@ -353,15 +318,14 @@
     };
   }
   installVisibilityInterceptor();
-  function reportVisibility() { // 派发事件让游戏按（欺骗后的）可见性重新上报服务器
+  function reportVisibility() {
     try { document.dispatchEvent(new Event("visibilitychange")); } catch {}
   }
-  function enableKeepAlive() { reportVisibility(); }  // 开启：立即补报 visible
-  function disableKeepAlive() { reportVisibility(); } // 关闭：按真实可见性重新上报（真隐藏则恢复服务器暂停）
-  const EMPTY_MAP = new Map(); // 惰性查找表占位：非生产场景 recipes/inv 只读引用（tickEta 空查返回 null）
-  let pipError = null; // PiP 失败信息 {text, until}：并入 status 行展示，避免被下一拍渲染直接覆盖
+  function enableKeepAlive() { reportVisibility(); }
+  function disableKeepAlive() { reportVisibility(); }
+  const EMPTY_MAP = new Map();
+  let pipError = null;
 
-  // ---------- 数据模型（DOM 与画中画共用） ----------
   function buildModel() {
     const g = getGameStore();
     if (!g) return { status: "等待游戏加载…", sections: [], empty: null, alert: null };
@@ -375,7 +339,6 @@
     const parts = [];
     const alert = computeAlert(g, now);
 
-    // 查找表：技能 tick 必建；配方/背包仅生产场景需要（每拍全量重建是纯开销）
     const cur = g.currentActivity;
     const q = g.activityQueue ?? [];
     const skillTick = new Map();
@@ -387,13 +350,11 @@
     const inv = needCraft ? new Map((g.inventory ?? []).map((it) => [it.itemId, it.quantity ?? 0])) : EMPTY_MAP;
     const ctx = { skillTick, recipes, inv, nowMs: now };
 
-    // 当前（常驻）：活动 → 战斗 → 空闲 三态必显示一行
-    const craftCtx = computeCraftCtx(cur, recipes, inv, skillTick); // 生产活动：材料感知
+    const craftCtx = computeCraftCtx(cur, recipes, inv, skillTick);
     {
       const rows = [];
       if (cur) {
         const eta = tickEta(cur, ctx);
-        // 联合对象判别：强化/炼金/采集专用字段优先于残留的 skillType/craftingProfession
         const label = activityLabel(cur, g);
         rows.push({ label: "活动", value: label, accent: true });
         if (craftCtx) {
@@ -434,12 +395,10 @@
       const sumTxt = known ? (known < q.length ? "≥ " : "") + fmtDur(total) : (hasInf ? "" : "—");
       rows.push({ label: `合计（${q.length}/${g.maxQueueSlots ?? "?"}）`, value: sumTxt + (hasInf ? "＋∞" : "") });
       if (g.queueLoopEnabled) rows.push({ label: "循环模式", value: "开启" });
-      // 战斗时游戏主面板隐藏队列；这里标注语义，避免误以为显示错误
       parts.push({ title: g.combatState ? "队列（战斗结束后执行）" : "队列", rows });
     }
 
-    // 升级预估：只显示与"当前正在进行的内容"对应的技能（采样全量保留）
-    const curSkill = (isEnhancementActivity(cur) || isAlchemyActivity(cur)) ? null // 强化/炼金无对应技能采样（残留 skillType 不可信）
+    const curSkill = (isEnhancementActivity(cur) || isAlchemyActivity(cur)) ? null
       : (cur ? (cur.skillType ?? cur.craftingProfession ?? null) : null);
     const inCombat = !!g.combatState;
     const upRows = [];
@@ -466,7 +425,6 @@
         });
       }
     }
-    // 生产预估：确定性计算（CraftTick 捕获 + 配方 + 背包材料），免采样
     let skipSampled = false;
     if (craftCtx) {
       const cx = craftXp.get(cur.craftingProfession);
@@ -481,7 +439,6 @@
           { label: "升级时间", value: fmtClock(crafts * craftCtx.timePerCraft), accent: true },
         );
       }
-      // 材料消耗与实际剩余次数
       if (craftCtx.mats.length) {
         rows.push({ label: "材料（每次）",
           value: craftCtx.mats.map((m) => `${m.name} ×${m.per}`).join("、") });
@@ -495,7 +452,7 @@
         rows.push({ label: craftCtx.short ? "缺料停止时间" : "料尽/完成时间",
           value: "≈ " + fmtClock(craftCtx.eta), accent: !craftCtx.short });
       parts.push({ title: "生产预估", rows });
-      skipSampled = true; // 生产时压制旧的采样式升级区
+      skipSampled = true;
     }
     upRows.sort((a, b) => a.label.localeCompare(b.label));
     if (!skipSampled && upRows.length) parts.push({ title: "升级预估", rows: upRows });
@@ -503,7 +460,6 @@
     return { status, sections: parts, empty: parts.length ? null : "无活动/队列，无技能在训练", alert };
   }
 
-  // ---------- DOM 面板 ----------
   const root = document.createElement("div");
   root.id = "fishidle-hud";
   root.innerHTML = `
@@ -531,14 +487,12 @@
 
   const alertText = (a) => a.reviveIn != null ? `☠ 已死亡（${fmtDur(a.reviveIn)} 后复活）` : "☠ 已死亡";
 
-  // 统一行模板（HUD 面板/对话框注入共用）：accent/stale 为 HUD 行，accentColor/bold/lo/gap 为对话框行
   const fhRow = (label, value, o = {}) =>
     `<div style="display:flex;justify-content:space-between;gap:${o.gap ?? 12}px;${o.stale ? "opacity:.55;" : ""}">
        <span style="opacity:${o.lo ?? ".75"};">${label}</span>
        <span style="${o.accent ? `color:${o.accentColor ?? "#7fd4a0"};${o.bold ? "font-weight:600;" : ""}` : ""}font-variant-numeric:tabular-nums;">${value}</span>
      </div>`;
 
-  // 渲染 diff：status 与正文 HTML 均无变化时跳过 DOM 写入（空闲零开销，也不触发 MutationObserver）
   let lastBodyHtml = null, lastStatus = null;
   function renderDom(m) {
     if (m.status !== lastStatus) { elStatus.textContent = m.status; lastStatus = m.status; }
@@ -554,11 +508,9 @@
       : m.sections.map(secHtml).join(""));
     if (html !== lastBodyHtml) { elBody.innerHTML = html; lastBodyHtml = html; }
   }
-  // ---------- 告警：标签页标题 ----------
   let wasDead = false, deadEpisode = false, aliveSince = 0;
-  const baseTitle = document.title || "FishIdle"; // document-start 时 <title> 可能尚未解析
+  const baseTitle = document.title || "FishIdle";
   function runAlertEffects(m, now) {
-    // 死亡期滞回：combatState 补丁流会让告警瞬时抖动回 null，3 秒内视为同一次死亡，标题不会来回闪。
     if (m.alert) { deadEpisode = true; aliveSince = 0; }
     else if (deadEpisode) {
       if (!aliveSince) aliveSince = now;
@@ -570,7 +522,6 @@
     wasDead = eff;
   }
 
-  // ---------- 视频 Picture-in-Picture（2x 分辨率，字体清晰） ----------
   const PIP_SCALE = 2, PIP_W = 340;
   let pipVideo = null, pipCanvas = null, pipCtx = null, pipStream = null;
   async function togglePip() {
@@ -584,15 +535,15 @@
       pipVideo.muted = true; pipVideo.playsInline = true; pipVideo.autoplay = true;
       pipVideo.style.cssText = "position:fixed;left:-9999px;width:1px;height:1px;";
       pipVideo.srcObject = pipStream;
-      pipVideo.addEventListener("leavepictureinpicture", cleanupPip); // 原生关闭小窗也走清理（流停止+按钮复位）
+      pipVideo.addEventListener("leavepictureinpicture", cleanupPip);
       document.body.appendChild(pipVideo);
-      drawPip(buildModel()); // 先画一帧：video 需至少一帧才有 metadata
+      drawPip(buildModel());
       await pipVideo.play();
       await pipVideo.requestPictureInPicture();
       root.querySelector("#fh-pip").textContent = "↩";
     } catch (e) {
       cleanupPip();
-      pipError = { text: "置顶失败: " + (e.message || e.name), until: Date.now() + 5000 }; // 并入 status 行显示 5s（原直接写 elStatus 会被下一拍覆盖）
+      pipError = { text: "置顶失败: " + (e.message || e.name), until: Date.now() + 5000 };
     }
   }
   function cleanupPip() {
@@ -602,7 +553,6 @@
     root.querySelector("#fh-pip").textContent = "📌";
   }
   root.querySelector("#fh-pip").addEventListener("click", togglePip);
-  // ---------- 保持活跃开关（头部 ⚡，状态持久化） ----------
   const elKa = root.querySelector("#fh-ka");
   function syncKaBtn() {
     const active = keepAlive.on;
@@ -641,13 +591,13 @@
     const H = Math.min(640, 34 + lines.length * LH + PAD * 2 + 8);
     if (pipCanvas.height !== H * PIP_SCALE) pipCanvas.height = H * PIP_SCALE;
     const c = pipCtx;
-    c.setTransform(PIP_SCALE, 0, 0, PIP_SCALE, 0, 0); // 逻辑坐标绘制，物理 2x
+    c.setTransform(PIP_SCALE, 0, 0, PIP_SCALE, 0, 0);
     c.fillStyle = "#10141c";
     c.fillRect(0, 0, W, H);
     let y = PAD + 4;
     for (const l of lines) {
       if (l.gap) y += l.gap;
-      if (l.banner) { // 死亡横幅：红底白字
+      if (l.banner) {
         c.fillStyle = "#b91c1c";
         c.fillRect(PAD - 4, y, W - (PAD - 4) * 2, LH);
         c.fillStyle = "#fff";
@@ -671,20 +621,17 @@
     }
   }
 
-  // ---------- 开始制造对话框增强：注入升级所需次数与预计时间 ----------
   const FH_INFO_ID = "fh-craft-level-info";
   function enhanceStartDialog() {
     if (!modules.dialog) return;
     const dlg = document.querySelector('[role=dialog]');
     if (!dlg) return;
-    const text = dlg.innerText?.replace(/\s+/g, " ") ?? ""; // 单次读取（innerText 强制布局，避免重复读）
+    const text = dlg.innerText?.replace(/\s+/g, " ") ?? "";
     if (!text.includes("重复次数")) {
-      // 对话框已关闭/空壳（Vue 保留节点）：清掉注入块并复位标记，防残留显示
       document.getElementById(FH_INFO_ID)?.remove();
       delete dlg.dataset.fhItem;
       return;
     }
-    // 采集："开始采集 × <资源名>"；制造："开始制造 × <产物名>"；炼金同对话框；战斗不处理
     const gm = text.match(/开始采集\s*[×x]\s*([^\s]+)/);
     const am = text.match(/开始炼金\s*[×x]\s*([^\s]+)/);
     const m = gm ?? am ?? text.match(/开始(?!采集|战斗|炼金)[^×\s]*\s*[×x]\s*([^\s]+)/);
@@ -692,17 +639,15 @@
     const itemName = m[1];
     const isGather = !!gm, isAlchemy = !!am;
     const fhKey = (isGather ? "G:" : isAlchemy ? "A:" : "C:") + itemName;
-    // 定位锚点：官方"添加到队列"按钮的容器；退化用"重复次数"选择块（插到其上方）。
-    // 对话框打开瞬间按钮可能尚未挂载——锚点未就绪时等待下一拍，绝不直挂对话框壳（壳在关闭后仍显示 → 左上角残留）
     const anchor = [...dlg.querySelectorAll("button")].find((b) => b.innerText.trim() === "添加到队列")
       ?.closest("div:not(#" + FH_INFO_ID + ")");
     const repHost = [...dlg.querySelectorAll("div")]
-      .filter((d) => !d.querySelector("div") && d.innerText.includes("重复次数") && d.innerText.length < 200) // 叶子级选择块（外层容器文本同样含"重复次数"会误锚）
+      .filter((d) => !d.querySelector("div") && d.innerText.includes("重复次数") && d.innerText.length < 200)
       .pop() ?? null;
     const target = anchor ?? repHost;
-    if (!target) return; // 结构未就绪：不设 fhItem，下个 mutation 重试
+    if (!target) return;
     const info = document.getElementById(FH_INFO_ID);
-    if (dlg.dataset.fhItem === fhKey && info && info.nextElementSibling === target) return; // 已在正确位置
+    if (dlg.dataset.fhItem === fhKey && info && info.nextElementSibling === target) return;
     dlg.dataset.fhItem = fhKey;
     info?.remove();
 
@@ -724,7 +669,6 @@
       const gx = gatherXp.get(st + "|" + resource.id);
       if (!sk || !(sk.nextLevelExp > 0)) host.innerHTML = dlgRow("FishIdle HUD", "未找到技能数据");
       else {
-        // 单次经验/间隔：官方公式（与采集页 tooltip 同源）即时可得；已有实测采样则优先（服务器 catalog 覆盖时校准）
         const per = gx?.per > 0 ? gx.per : gatherXpPer(resource.tier, sk.level);
         const t = Number.isFinite(gx?.tick) && gx.tick > 0 ? gx.tick
           : gatherInterval(resource.tier, sk.level, gatherToolTier(g, st));
@@ -733,7 +677,7 @@
           dlgRow(`升级所需次数（${zh(st)} Lv.${sk.level}，${sk.experience}/${sk.nextLevelExp} xp，每次 +${per}）`, `${times} 次`, true) +
           dlgRow("升级预计时间（单次 ≈ " + (+t).toFixed(1) + " 秒）", "≈ " + fmtDur(times * t), true);
       }
-    } else if (isAlchemy) { // 炼金无客户端目录：显示已采样经验，无则提示先生产一次
+    } else if (isAlchemy) {
       host.innerHTML = ax
         ? dlgRow(`炼金 Lv.${ax.lv ?? "?"}（${ax.xp}/${ax.next} xp）`, "单次经验待采样", true)
         : dlgRow("炼金升级预估", "先生产一次以采样经验数据");
@@ -748,7 +692,6 @@
         dlgRow(`升级所需次数（${zh(recipe.profession)} Lv.${cx.lv}，${cx.xp}/${cx.next} xp）`, `${crafts} 次`, true) +
         (t ? dlgRow("升级预计时间（单次 ≈ " + (+t).toFixed(1) + " 秒）", "≈ " + fmtDur(crafts * t), true) : "");
     }
-    // 收藏按钮：记住当前次数选择（收藏夹模块关闭时不显示）
     if (modules.fav && (recipe || resource)) {
       const favBtn = document.createElement("button");
       favBtn.type = "button";
@@ -757,7 +700,6 @@
         background:rgba(250,204,21,.12);border:1px dashed rgba(250,204,21,.4);`;
       favBtn.textContent = "⭐ 收藏此项（记住当前次数）";
       favBtn.onclick = () => {
-        // 解析对话框当前次数："重复次数 1 MAX ∞ − +" → 1 / ∞(→0)
         const repText = [...dlg.querySelectorAll("div")].find((d) => d.innerText.includes("重复次数") && d.innerText.length < 200)?.innerText ?? "";
         const cm = repText.match(/重复次数\s*(\d+|∞|MAX)/);
         const count = !cm ? 1 : (cm[1] === "∞" ? 0 : cm[1] === "MAX" ? 0 : Math.max(0, parseInt(cm[1])));
@@ -772,9 +714,8 @@
       };
       host.appendChild(favBtn);
     }
-    target.parentNode.insertBefore(host, target); // 锚点已确保就绪（见上），插到其上方
+    target.parentNode.insertBefore(host, target);
   }
-  // HUD 自身 DOM（面板/收藏页/计算页）变更 = 自触发，直接跳过；侧栏导航安装再按 250ms 节流
   const inHudTree = (n) => n === root || root.contains(n)
     || (favPage?.contains(n) ?? false) || (calcPage?.contains(n) ?? false);
   let navInstallAt = 0;
@@ -788,9 +729,8 @@
     }
   });
 
-  // ---------- 收藏栏：游戏侧栏（任务与交易行之间）+ 快速开始 ----------
   const FAV_LS = "fishidle-hud.favorites";
-  const loadFavs = () => { // 读取时归一化：过滤脏数据 + 补默认 kind（旧数据无 kind 视为 Crafting），下游不再判断默认值
+  const loadFavs = () => {
     try {
       return JSON.parse(localStorage.getItem(FAV_LS) || "[]")
         .filter((f) => f && f.id != null && f.prof != null)
@@ -805,24 +745,21 @@
       if (fav.kind === "Gathering") {
         const r = (g.resources ?? []).find((x) => x.id === fav.id);
         if (!r) { console.warn("[FishIdle HUD] 收藏的资源不存在:", fav.name); return; }
-        if (toQueue) // 官方对话框入队序列（Gathering 分支，18 参：skillType, locationId, resourceId, …）
+        if (toQueue)
           g.addToQueue("Gathering", r.skillType, r.locationId ?? null, r.id, null, null, null, null, fav.count, null, null, null, null, null, null, null, false, 0);
-        else // 立即开始：与对话框按钮同一 store action（skillType, locationId, resourceId, count(∞=0), mode, depthLayer）
+        else
           g.startActivity(r.skillType, r.locationId ?? null, r.id, fav.count, "keep", 0);
-      } else if (toQueue) // addToQueue 官方 UI 调用序列（Crafting 分支，18 参）
+      } else if (toQueue)
         g.addToQueue("Crafting", null, null, null, fav.prof, fav.id, null, null, fav.count, null, null, null, null, null, null, null, false, 0);
-      else // 立即开始：与对话框按钮同一 store action（profession, recipeId, count(∞=0), mode, baseEnh）
+      else
         g.startCraftingActivity(fav.prof, fav.id, fav.count, "keep", null);
     } catch (e) { console.warn("[FishIdle HUD] 收藏启动失败:", e); }
   }
-  // ---------- 收藏页面：主内容区完整 UI（复刻制造页面布局） ----------
   let favPage = null, favPageNav = null;
   function hideFavPage() {
     favPage?.remove(); favPage = null;
     favPageNav?.classList.remove("active");
   }
-  // 自包含卡片样式：craft-panel 的 CSS 是懒加载块（面板未开过则规则不存在，
-  // 依赖游戏类名/scoped 属性有加载时序问题），按实测视觉参数自绘
   function favCardHtml(f, i, ctxInfo) {
     const { recipe, resource, gx, skill, possible, cx } = ctxInfo;
     const isGather = f.kind === "Gathering";
@@ -879,7 +816,7 @@
   }
   function renderFavPage() {
     if (!favPage) return;
-    const scrollTop = favPage.scrollTop; // 重建后保留滚动位置（防删除/交互跳顶）
+    const scrollTop = favPage.scrollTop;
     const g = getGameStore();
     const favs = loadFavs();
     const recipes = new Map((g?.craftingRecipes ?? []).map((r) => [r.id, r]));
@@ -919,7 +856,6 @@
       };
     }
   }
-  // ---------- 覆盖层面板公共：创建 + 定位同步主内容区；全局唯一 resize 处理（防监听累积） ----------
   function createOverlayPanel(id) {
     const el = document.createElement("div");
     el.id = id;
@@ -944,14 +880,12 @@
     renderFavPage();
     favPageNav?.classList.add("active");
   }
-  // 点任意真实侧栏条目 → 关闭收藏页
   document.addEventListener("click", (e) => {
     if (!favPage && !calcPage) return;
     const entry = e.target.closest?.(".skill-entry");
     if (entry && entry.id !== "fh-fav-nav" && entry.id !== "fh-calc-nav") { hideFavPage(); hideCalcPage(); }
   }, true);
   addEventListener("resize", () => { syncPanelPos(favPage); syncPanelPos(calcPage); });
-  // 侧栏导航按钮安装（收藏/发育共用结构）：data-v 复刻 scoped 属性，锚点上方插入
   function installSidebarNav(id, icon, label, title, onClick, anchor) {
     if (document.getElementById(id) || !anchor?.parentNode) return null;
     const btn = document.createElement("button");
@@ -969,20 +903,15 @@
     return btn;
   }
   function installFavNav() {
-    if (!modules.fav) return; // 收藏夹模块关闭时不装入口
+    if (!modules.fav) return;
     const btn = installSidebarNav("fh-fav-nav", "⭐", "收藏", "生产收藏（FishIdle HUD）",
-      toggleFavPage, document.querySelector(".skill-entry--market")); // 交易行上方
+      toggleFavPage, document.querySelector(".skill-entry--market"));
     if (btn) favPageNav = btn;
   }
 
-  // ---------- 发育计算器：阶段材料缺口 / 耗时 / 价格 / 一键收藏 ----------
-  // 各职业的装备线 = 护甲类型 + 武器线（[配方目录类名, 需求数]）。T1–T7 每阶按"目录类名 + 品阶"从配方目录取件，
-  // 件名跟着游戏目录走；末阶即计算目标，低阶件作为材料链自然出现在 MRP 行中。
-  // 武器线各取一个代表：巨锤/巨斧、战锤/战斧的配料与对应的剑完全相同；弩的配料与弓不同，未单列。
-  // 冰与火法在 T1–T7 共用通用魔杖 + 魔典 + 布甲（T8 才分成极寒/焚界两套）。
   const CALC_TIERS = [1, 2, 3, 4, 5, 6, 7];
-  const ARMOR_SLOTS = ["Head", "Chest", "Legs", "Hands", "Feet"]; // 件序：帽、衣、裤、腕、靴
-  const ARMOR_TITLE = { Plate: "板甲", Leather: "套装", Cloth: "法袍" }; // 块标题的护甲名后缀，前缀取五件护甲名的公共前缀
+  const ARMOR_SLOTS = ["Head", "Chest", "Legs", "Hands", "Feet"];
+  const ARMOR_TITLE = { Plate: "板甲", Leather: "套装", Cloth: "法袍" };
   const CLASS_SETS = [
     { id: "warrior", label: "战士", armor: "Plate", weapons: [["WeaponGreatsword", 1]], hint: "巨剑 + 板甲五件。巨锤、巨斧的配料与巨剑相同。" },
     { id: "tank", label: "坦克", armor: "Plate", weapons: [["WeaponSword", 1], ["WeaponShield", 1]], hint: "战剑 + 盾 + 板甲五件。战锤、战斧的配料与战剑相同。" },
@@ -994,14 +923,14 @@
   ];
   const CLASS_LS = "fishidle-hud.calcClass";
   let calcClassId = (() => { try { return localStorage.getItem(CLASS_LS) ?? ""; } catch { return ""; } })();
-  if (!CLASS_SETS.some((c) => c.id === calcClassId)) calcClassId = "thief"; // 默认盗贼
+  if (!CLASS_SETS.some((c) => c.id === calcClassId)) calcClassId = "thief";
   const calcClass = () => CLASS_SETS.find((c) => c.id === calcClassId);
   const commonPrefix = (names) => {
     let p = names[0] ?? "";
     for (const n of names) while (p && !n.startsWith(p)) p = p.slice(0, -1);
     return p;
   };
-  function classTiers(cls) { // [{ tier, title, items: [[件名, 需求数]] }]；目录里缺件时跳过该件
+  function classTiers(cls) {
     const byCat = new Map((getGameStore()?.craftingRecipes ?? [])
       .map((r) => [r.craftedItemCategory + ":" + r.craftedItemTier, r.craftedItemName]));
     const pick = (cat, t) => byCat.get(cat + ":" + t);
@@ -1015,7 +944,7 @@
   function selectCalcClass(id) {
     calcClassId = id;
     try { localStorage.setItem(CLASS_LS, id); } catch {}
-    calcExpanded.clear(); calcBlockOpen.clear(); calcBlockInit = false; // 展开状态不跨职业沿用
+    calcExpanded.clear(); calcBlockOpen.clear(); calcBlockInit = false;
     renderCalcPage();
     if (calcPage) calcPage.scrollTop = 0;
   }
@@ -1023,16 +952,15 @@
   function selectCalcTotalTier(tier) {
     calcTotalTier = tier;
     try { localStorage.setItem(TIER_LS, String(tier)); } catch {}
-    calcTotalOpen = true; // 选了阶就直接展开，让人看到结果
+    calcTotalOpen = true;
     renderCalcPage();
   }
 
-  function computeMrp(goals) { // goals: [{ name, qty }]，即所选职业的末阶套装
+  function computeMrp(goals) {
     const g = getGameStore();
     if (!g) return null;
     const byProduct = new Map((g.craftingRecipes ?? []).map((r) => [r.craftedItemName, r]));
     const have = new Map((g.inventory ?? []).map((i) => [i.name, i.quantity ?? 0]));
-    // 穿戴中的装备计入"有"：装备对象字段是 itemName（非 name）
     for (const w of g.equippedWeapons ?? []) {
       const n = w?.itemName ?? w?.name;
       if (n) have.set(n, (have.get(n) ?? 0) + 1);
@@ -1041,7 +969,6 @@
       const n = a?.itemName ?? a?.name;
       if (n) have.set(n, (have.get(n) ?? 0) + 1);
     }
-    // Kahn 拓扑排序（消费者先于原料）：共享中间件（如亚麻布）的毛需求才能聚合完整
     const reachable = new Set();
     const visit = (n) => {
       if (reachable.has(n)) return; reachable.add(n);
@@ -1065,7 +992,7 @@
     const gross = new Map();
     goals.forEach((gl) => gross.set(gl.name, (gross.get(gl.name) ?? 0) + gl.qty));
     const rows = [], inRows = new Set();
-    for (const name of order) { // 处理产品时其毛需求已定（含上层净需求展开）；Kahn 序含原材料
+    for (const name of order) {
       const r = byProduct.get(name);
       const gr = gross.get(name) ?? 0, h = have.get(name) ?? 0;
       const net = Math.max(0, gr - h);
@@ -1074,10 +1001,8 @@
       rows.push({ name, gross: gr, have: h, net, recipe: r ?? null });
       inRows.add(name);
     }
-    for (const [name, gr] of gross) if (!byProduct.has(name) && !inRows.has(name)) // 未入序的原材料
+    for (const [name, gr] of gross) if (!byProduct.has(name) && !inRows.has(name))
       rows.push({ name, gross: gr, have: have.get(name) ?? 0, net: Math.max(0, gr - (have.get(name) ?? 0)), recipe: null });
-    // 配方树（产物→原料，环守卫）：根节点 qty 为 null，子节点 qty = 做一件父物品的单品消耗（配方用量）。
-    // 树里不带库存抵扣、不跨分支聚合；整套合计看 rows。
     const mkNode = (name, qty, path) => {
       const r = byProduct.get(name);
       const children = [];
@@ -1092,30 +1017,28 @@
 
   let calcPage = null, calcNav = null;
   function hideCalcPage() { calcPage?.remove(); calcPage = null; calcNav?.classList.remove("active"); }
-  const calcExpanded = new Set(); // 子树展开状态（path key）
+  const calcExpanded = new Set();
   let calcBlockInit = false;
-  const calcBlockOpen = new Set(); // 套装块展开状态
-  let calcTotalOpen = false; // 底部"缺口合计"的展开状态
+  const calcBlockOpen = new Set();
+  let calcTotalOpen = false;
   const TIER_LS = "fishidle-hud.calcTier";
-  let calcTotalTier = 0; // 缺口合计统计到哪一阶；0 = 自动取第一个还没凑齐的阶
+  let calcTotalTier = 0;
   try { const v = +localStorage.getItem(TIER_LS); if (CALC_TIERS.includes(v)) calcTotalTier = v; } catch {}
   function renderCalcPage() {
     if (!calcPage) return;
-    const scrollTop = calcPage.scrollTop; // 重建后保留滚动位置（点块/行开关不跳顶）
+    const scrollTop = calcPage.scrollTop;
     const cls = calcClass(), tiers = classTiers(cls), last = tiers.at(-1);
     const mrp = last && computeMrp(last.items.map(([name, qty]) => ({ name, qty })));
     if (!mrp) { calcPage.innerHTML = getGameStore() ? "配方目录里没有这套装备的数据" : "等待游戏加载…"; return; }
     const rowBy = new Map(mrp.rows.map((r) => [r.name, r]));
-    const gate = (recipe) => { // 技能门槛
+    const gate = (recipe) => {
       if (!recipe) return "";
       const cur = craftXp.get(recipe.profession)?.lv ?? "?";
       const ok = typeof cur === "number" && cur >= recipe.requiredLevel;
       return `<span style="font-size:11px;color:${ok ? "#7fe0b8" : "#f87171"};">${zh(recipe.profession)} ${cur}/${recipe.requiredLevel}${ok ? "" : " ⚠"}</span>`;
     };
-    // 汇总：按扁平唯一行计算（树中共享节点不重复计）
     let totalTime = 0;
     for (const r of mrp.rows) if (r.recipe) totalTime += (r.recipe.baseTickIntervalSeconds ?? 0) * r.net;
-    // 行渲染：name/recipe 取自物料；count 是算耗时用的件数；fav 是 ⭐+ 加入收藏的件数，favTitle 是它的悬停说明
     const rowHtml = (o) => {
       const mid = o.recipe
         ? `<div style="font-variant-numeric:tabular-nums;opacity:.8;">${o.count ? fmtDur((o.recipe.baseTickIntervalSeconds ?? 0) * o.count) : "—"}</div>`
@@ -1130,11 +1053,9 @@
           ${mid}${fav}
         </div>`;
     };
-    // 整套口径的一行：需 / 有 / 缺 取自扁平 MRP 的行 r（各阶套装件用末阶口径，底部合计用所选阶口径）
     const aggRow = (r, o) => rowHtml({ ...o, name: r.name, recipe: r.recipe, count: r.net, fav: r.net,
       need: `<span style="opacity:.6;font-size:11px;">需${r.gross} 有${r.have}</span>`,
       short: `<div style="font-variant-numeric:tabular-nums;color:${r.net ? (r.recipe ? "#fbbf24" : "#f87171") : "#7fe0b8"};">缺 ${r.net}</div>` });
-    // 配方树：根行是整套口径；子行只显示"做一件父物品"的单品消耗 ×N，耗时也按这一件的用量算
     const nodeHtml = (node, path) => {
       const key = path + "/" + node.name, hasKids = node.children.length > 0, open = calcExpanded.has(key);
       const arrow = hasKids
@@ -1149,7 +1070,6 @@
         ${hasKids && open ? `<div style="margin-left:22px;border-left:1px dashed rgba(138,180,248,.25);">${node.children.map((c) => nodeHtml(c, key)).join("")}</div>` : ""}
       </div>`;
     };
-    // 套装块：按品阶分组（T1–T7），首个未满足的默认展开
     const tierSatisfied = (t) => t.items.every(([n]) => (rowBy.get(n)?.net ?? 1) === 0);
     if (!calcBlockInit) {
       const first = tiers.find((t) => !tierSatisfied(t));
@@ -1171,7 +1091,6 @@
         </div>` : ""}
       </div>`;
     }).join("");
-    // 缺口合计：树里只显示单品消耗，还缺多少在这里按物料看；可切换统计到哪一阶，没选过时取第一个还没凑齐的阶
     const totalTier = calcTotalTier || tiers.find((t) => !tierSatisfied(t))?.tier || last.tier;
     const totalRows = totalTier === last.tier ? mrp.rows
       : computeMrp(tiers.find((t) => t.tier === totalTier).items.map(([name, qty]) => ({ name, qty }))).rows;
@@ -1189,7 +1108,7 @@
         ${shortRows.map((r) => aggRow(r, { arrow: `<span style="width:14px;display:inline-block;opacity:.25;">·</span>`, favTitle: `按 T${totalTier} 的缺口加入收藏` })).join("")}
       </div>` : ""}
     </div>`;
-    const classBtn = (c) => { // 职业切换按钮：选中的高亮
+    const classBtn = (c) => {
       const on = c.id === cls.id;
       return `<button type="button" data-class="${c.id}" style="all:unset;cursor:pointer;padding:3px 10px;border-radius:6px;font-size:12px;
         background:${on ? "#1d4ed8" : "rgba(255,255,255,.06)"};color:${on ? "#fff" : "#c9d1d9"};${on ? "font-weight:600;" : ""}">${c.label}</button>`;
@@ -1205,7 +1124,7 @@
       </div>` + blockHtml + totalHtml;
     calcPage.scrollTop = scrollTop;
     calcPage.querySelector("#fh-calc-close").onclick = hideCalcPage;
-    calcPage.onclick = (ev) => { // 事件委托：合计开关 + 块开关 + 子树开关
+    calcPage.onclick = (ev) => {
       if (ev.target.closest?.("[data-total]")) { calcTotalOpen = !calcTotalOpen; return renderCalcPage(); }
       const blk = ev.target.closest?.("[data-block]");
       if (blk && !ev.target.closest("[data-node]")) {
@@ -1242,33 +1161,32 @@
     calcNav?.classList.add("active");
   }
   function installCalcNav() {
-    if (!modules.calc) return; // 发育计算器模块关闭时不装入口
+    if (!modules.calc) return;
     const btn = installSidebarNav("fh-calc-nav", "📊", "发育", "发育计算器（FishIdle HUD）",
-      toggleCalcPage, document.getElementById("fh-fav-nav") ?? document.querySelector(".skill-entry--market")); // 收藏上方
+      toggleCalcPage, document.getElementById("fh-fav-nav") ?? document.querySelector(".skill-entry--market"));
     if (btn) calcNav = btn;
   }
 
-  // ---------- 模块开关：游戏设置页的 jojo-plugin 页签 ----------
   const MODULES_LS = "fishidle-hud.modules";
-  const MODULES = [ // 四个模块，默认全部开启
+  const MODULES = [
     { key: "hud", label: "悬浮面板", desc: "右上角的悬浮面板和置顶小窗" },
     { key: "calc", label: "发育计算器", desc: "左侧栏的发育入口" },
     { key: "fav", label: "收藏夹", desc: "左侧栏的收藏入口，以及对话框和计算器里的收藏按钮" },
     { key: "dialog", label: "对话框增强", desc: "开始制造 / 采集 / 炼金对话框里的升级次数和预计时间" },
   ];
   const modules = Object.fromEntries(MODULES.map((m) => [m.key, true]));
-  try { // 只认已知的键和布尔值，其余一律保持默认开启
+  try {
     for (const [k, v] of Object.entries(JSON.parse(localStorage.getItem(MODULES_LS) || "{}")))
       if (k in modules && typeof v === "boolean") modules[k] = v;
   } catch {}
-  function applyModules() { // 让四个开关立即生效
+  function applyModules() {
     root.style.display = modules.hud ? "" : "none";
     if (!modules.hud && document.pictureInPictureElement) document.exitPictureInPicture().catch(() => {});
     if (modules.calc) installCalcNav(); else { hideCalcPage(); calcNav?.remove(); calcNav = null; }
     if (modules.fav) installFavNav(); else { hideFavPage(); favPageNav?.remove(); favPageNav = null; }
-    document.getElementById(FH_INFO_ID)?.remove(); // 对话框注入块按当前开关重建
+    document.getElementById(FH_INFO_ID)?.remove();
     enhanceStartDialog();
-    if (calcPage) renderCalcPage(); // 计算器里的 ⭐+ 随收藏夹开关增减
+    if (calcPage) renderCalcPage();
   }
   function setModule(key, on) {
     modules[key] = on;
@@ -1276,9 +1194,9 @@
     applyModules();
   }
   const SETTINGS_TAB_ID = "fh-settings-tab", SETTINGS_PANE_ID = "fh-settings-pane";
-  let settingsTabOn = false, settingsTabBack = null; // jojo-plugin 页签是否选中；选中前高亮的那个原生页签（取消选中时还给它）
+  let settingsTabOn = false, settingsTabBack = null;
   function setSettingsTab(on) {
-    if (on && !settingsTabOn) { // 选中我们：先记下并撤掉原生页签的高亮，之后取消选中时再还回去
+    if (on && !settingsTabOn) {
       settingsTabBack = [...document.querySelectorAll(".settings-panel .sidebar-tab.active")].find((t) => t.id !== SETTINGS_TAB_ID) ?? null;
       settingsTabBack?.classList.remove("active");
     }
@@ -1287,16 +1205,15 @@
     document.getElementById(SETTINGS_TAB_ID)?.classList.toggle("active", on);
     const pane = document.getElementById(SETTINGS_PANE_ID);
     if (pane) pane.style.display = on ? "" : "none";
-    const content = document.querySelector(".settings-panel .settings-content"); // 选中我们时藏起游戏自己的内容，取消选中时恢复
+    const content = document.querySelector(".settings-panel .settings-content");
     if (content) for (const el of content.children) if (el.id !== SETTINGS_PANE_ID) el.style.display = on ? "none" : "";
   }
-  function installSettingsTab() { // 克隆原生页签插在最后一个之后；内容面板放进 .settings-content
+  function installSettingsTab() {
     const sidebar = document.querySelector(".settings-panel .settings-sidebar");
     const content = document.querySelector(".settings-panel .settings-content");
     const native = sidebar ? [...sidebar.querySelectorAll(".sidebar-tab")] : [];
     if (!content || !native.length || document.getElementById(SETTINGS_TAB_ID)) return;
-    setSettingsTab(false); // 设置页是新挂载的：从"未选中"开始，顺带把上次可能藏住的原生内容放出来
-    // 页签：克隆原生页签再换图标和文字，scoped 属性随克隆带过来，原生样式才生效
+    setSettingsTab(false);
     const tab = native[0].cloneNode(true);
     tab.id = SETTINGS_TAB_ID;
     tab.classList.remove("active");
@@ -1305,7 +1222,6 @@
     if (use && document.getElementById("icon-magic")) use.setAttribute("xlink:href", "#icon-magic");
     tab.addEventListener("click", () => setSettingsTab(true));
     native.at(-1).after(tab);
-    // 内容面板：沿用游戏当前内容页的根类名和 scoped 属性，区块、标题、选项与原生页面同款
     const pane = document.createElement("div"), host = content.firstElementChild;
     const scopes = (host?.getAttributeNames() ?? []).filter((n) => n.startsWith("data-v-"));
     pane.id = SETTINGS_PANE_ID;
@@ -1324,11 +1240,10 @@
     pane.addEventListener("change", (e) => { const k = e.target.dataset.fhModule; if (k in modules) setModule(k, e.target.checked); });
     content.appendChild(pane);
   }
-  document.addEventListener("click", (e) => { // 点原生页签就把内容让还给游戏
+  document.addEventListener("click", (e) => {
     const t = e.target.closest?.(".settings-panel .sidebar-tab");
     if (t && t.id !== SETTINGS_TAB_ID && settingsTabOn) setSettingsTab(false);
   }, true);
-  // ---------- 拖拽 + 位置记忆 ----------
   try {
     const pos = JSON.parse(localStorage.getItem("fishidle-hud.pos") || "null");
     if (pos) { root.style.left = pos.left; root.style.top = pos.top; root.style.right = "auto"; }
@@ -1337,7 +1252,6 @@
     if (e.target.id === "fh-min" || e.target.id === "fh-pip" || e.target.id === "fh-ka") return;
     const sx = e.clientX - root.offsetLeft, sy = e.clientY - root.offsetTop;
     const mv = (ev) => {
-      // 四边限界：至少保留头部一条（60×28）在视口内，防拖丢找不回
       root.style.left = Math.max(0, Math.min(ev.clientX - sx, innerWidth - 60)) + "px";
       root.style.top = Math.max(0, Math.min(ev.clientY - sy, innerHeight - 28)) + "px";
       root.style.right = "auto";
@@ -1360,47 +1274,39 @@
   });
   applyCollapsed();
 
-  // ---------- 探测：事件驱动（死亡告警）+ 定时兜底 ----------
-  // combatState 的死亡写入（hp 归零 / deadUntil 出现）必经 Pinia 状态变更——$subscribe 即事件源；
-  // WebSocket 推送在后台不受浏览器定时器节流 → 事件路径前后台均即时。
-  // 500ms tick 只负责渲染（倒计时/速率采样显示）；告警逻辑走 probe()。
   let probeQueued = false, probeLastAt = 0;
   function probe() {
     probeLastAt = Date.now();
     if (!getGameStore()) return;
     const now = Date.now();
     const m = buildModel();
-    if (!document.hidden && modules.hud) renderDom(m); // 后台无人看或面板已关闭：跳过 DOM 渲染（PiP 走 renderPip 画布，不受影响）
+    if (!document.hidden && modules.hud) renderDom(m);
     renderPip(m);
     runAlertEffects(m, now);
   }
-  function queueProbe() { // $subscribe 事件路径：250ms 合并 + 微任务去抖
+  function queueProbe() {
     const now = Date.now();
     if (probeQueued || now - probeLastAt < 250) return;
     probeQueued = true;
     setTimeout(() => { probeQueued = false; probe(); }, 0);
   }
-  function hookProbe(g) { // 与 store 挂钩一次性安装（hookStore 内调用）
+  function hookProbe(g) {
     if (typeof g?.$subscribe !== "function") return;
     try { g.$subscribe(() => queueProbe(), { detached: true }); } catch {}
   }
 
-  // ---------- 主循环：渲染 ----------
   function tick() {
     const m = buildModel();
     if (!document.hidden && modules.hud) renderDom(m);
     renderPip(m);
-    // 后台兜底：保持活跃时服务器持续结算，战斗特效数组随事件增长，而游戏自身的
-    // 200ms prune 因 document.hidden 真值停摆——由本循环补剪（隐藏标签下 ≈1s 一拍）
     if (keepAlive.on && document.hidden) { try { getPiniaStore("combatVfx")?.prune?.(); } catch {} }
   }
-  // document-start 时 <body> 可能尚未解析：UI 挂载/观察延后到 DOMContentLoaded
   function startUi() {
-    applyModules(); // 先按模块开关定好面板显隐，再挂到页面上
+    applyModules();
     document.body.appendChild(root);
     hudObserver.observe(document.body, { childList: true, subtree: true });
-    setInterval(tick, 500);   // 渲染（倒计时/面板刷新）
-    setInterval(probe, 2000); // 兜底：事件丢失/标题滞回退出等纯时间性检查
+    setInterval(tick, 500);
+    setInterval(probe, 2000);
     tick();
     probe();
   }
