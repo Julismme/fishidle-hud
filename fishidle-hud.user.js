@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.0
+// @version      1.1.0.20261126
 // @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
+// @author      jojo
 // @match        https://fishidle.com/game/*
 // @run-at       document-start
 // @grant        none
@@ -12,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.0.20261126";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 

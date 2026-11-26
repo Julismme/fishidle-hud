@@ -136,7 +136,7 @@ Object.keys(localStorage).filter((k) => k.startsWith("fishidle-hud.")).forEach((
 
 ## 版本
 
-- V1.1.0：新增战斗监控（分均金币、药剂余量与耗尽时间、组队战斗同样生效）、药水告警阈值设置和渔舍计算器；死亡告警在组队战斗里也生效。
+- V1.1.0（2026-11-26 发布）：新增战斗监控（分均金币、药剂余量与耗尽时间、组队战斗同样生效）、药水告警阈值设置和渔舍计算器；死亡告警在组队战斗里也生效。版本号第四段是构建日期（如 `1.1.0.20261126`），在 Tampermonkey 里即可看到发布日期。
 - V1.0.0：首个公开版本。
 
 遇到问题或想提建议，请到 [Issues](https://github.com/julismme/fishidle-hud/issues)。
