@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.1.20261126
+// @version      1.1.2.20261126
 // @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
 // @author      jojo
 // @match        https://fishidle.com/game/*
@@ -13,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.1.20261126";
+  const VERSION = "1.1.2.20261126";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -308,11 +308,10 @@
     return null;
   }
 
-  const MAX_GAP_MS = 120_000;
-  const GOLD_WARMUP_MS = 30_000;
   const POTION_KEEP = 8;
   const POTION_STAT_LS = "fishidle-hud.potionStat";
   const POTION_LOW_LS = "fishidle-hud.potionLow";
+  const GOLD_WARMUP_MS = 30_000;
   const potionLowOf = (v) => (Number.isFinite(v) ? Math.min(1440, Math.max(0, Math.round(v))) : 10);
   let potionLowMin = 10;
   try { potionLowMin = potionLowOf(+(localStorage.getItem(POTION_LOW_LS) ?? 10)); } catch {}
@@ -322,24 +321,7 @@
       if (v && Number.isFinite(v.interval) && v.interval >= 0) potionStat.set(+k, { name: String(v.name ?? ""), interval: v.interval });
   } catch {}
   const persistPotionStat = () => { try { localStorage.setItem(POTION_STAT_LS, JSON.stringify(Object.fromEntries(potionStat))); } catch {} };
-  const RUN_STATE_SS = "fishidle-hud.combatRun";
-  const combatRun = { lastAt: 0, activeMs: 0, prevGold: null, loot: 0, key: null, who: null, savedAt: 0, potions: null, uses: new Map() };
-  try {
-    const s = JSON.parse(sessionStorage.getItem(RUN_STATE_SS) || "null");
-    const legacy = s && s.goldBase != null && s.lootBase == null;
-    if (s && !legacy && Number.isFinite(s.lastAt) && s.lastAt > 0) {
-      combatRun.lastAt = s.lastAt; combatRun.activeMs = Math.max(0, s.activeMs || 0);
-      combatRun.prevGold = Number.isFinite(s.prevGold) ? s.prevGold : null;
-      combatRun.loot = Math.max(0, s.loot || 0);
-      combatRun.key = typeof s.key === "string" ? s.key : null; combatRun.who = s.who ?? null;
-    }
-  } catch {}
-  function saveCombatRun() {
-    const r = combatRun;
-    try { sessionStorage.setItem(RUN_STATE_SS, JSON.stringify({ key: r.key, who: r.who, prevGold: r.prevGold, loot: r.loot, activeMs: r.activeMs, lastAt: r.lastAt })); } catch {}
-  }
-  addEventListener("pagehide", () => { if (combatRun.key != null) saveCombatRun(); });
-  document.addEventListener("freeze", () => { if (combatRun.key != null) saveCombatRun(); });
+  const combatRun = { key: null, loot: 0, activeMs: 0, potions: null, uses: new Map() };
   const goldOf = (g) => (g.currencies ?? []).find((c) => c.currencyType === "Gold")?.amount ?? null;
   const fixed1 = (x) => x.toFixed(1).replace(/\.0$/, "");
   const fmtCompact = (n) => n >= 1e9 ? fixed1(n / 1e9) + "B" : n >= 1e6 ? fixed1(n / 1e6) + "M"
@@ -347,37 +329,20 @@
 
   function stepCombatRun(g, cb, now) {
     const r = combatRun;
-    if (!cb) {
-      const idle = goldOf(g); if (idle != null) r.prevGold = idle;
-      return;
-    }
-    const settling = !document.hidden || keepAlive.on;
-    if (cb.who != null && r.who != null && cb.who !== r.who) r.key = null;
-    r.who = cb.who ?? r.who;
+    if (!cb) return;
     if (cb.key !== r.key) {
-      r.activeMs = 0; r.loot = 0; r.prevGold = null; r.key = cb.key; r.lastAt = now;
+      r.activeMs = 0; r.loot = 0; r.key = cb.key; r.uses.clear(); r.potions = null;
     }
-    const dt = now - r.lastAt;
-    if (settling && dt > 0 && dt <= MAX_GAP_MS) r.activeMs += dt;
-    r.lastAt = now;
-    if (cb.party) {
-      const gold = goldOf(g);
-      if (gold != null) {
-        if (r.prevGold != null) { const d = gold - r.prevGold; if (d > 0) r.loot += d; }
-        r.prevGold = gold;
-      }
-    } else {
-      r.loot = Number(cb.state.lootGold) || 0;
-      const started = cb.state.startedAt ? Date.parse(cb.state.startedAt) : NaN;
-      if (Number.isFinite(started)) r.activeMs = Math.max(0, now - started);
-    }
+    r.loot = Number(cb.state.lootGold) || 0;
+    const startedRaw = cb.state.startedAt;
+    const started = startedRaw instanceof Date ? startedRaw.getTime() : (startedRaw ? Date.parse(startedRaw) : NaN);
+    if (Number.isFinite(started)) r.activeMs = Math.max(0, now - started);
     const pots = new Map();
     for (const it of g.inventory ?? []) if (/^Potion/.test(it.category ?? "") && Number.isFinite(it.quantity))
       pots.set(it.itemId, (pots.get(it.itemId) ?? 0) + it.quantity);
     if (r.potions) for (const [id, prev] of r.potions)
       if ((pots.get(id) ?? 0) === prev - 1) notePotionUse(id, g.inventory, now);
     r.potions = pots;
-    if (now - r.savedAt >= 5000) { r.savedAt = now; saveCombatRun(); }
   }
   function notePotionUse(id, inventory, now) {
     let times = combatRun.uses.get(id);
