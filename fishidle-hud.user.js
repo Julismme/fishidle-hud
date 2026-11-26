@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.0.0
-// @description  fishidle.com 辅助面板：队列倒计时、升级预估、死亡告警、收藏、发育计算器。
+// @version      1.1.0
+// @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
 // @match        https://fishidle.com/game/*
 // @run-at       document-start
 // @grant        none
@@ -12,7 +12,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.0.0";
+  const VERSION = "1.1.0";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -267,16 +267,208 @@
   };
   const zh = (t) => SKILL_ZH[t] ?? t;
 
-  function computeAlert(g, nowMs) {
+  function sessionOf(kind, s, cb) {
+    const raw = s.startedAt ?? s.encounterId;
+    if (raw == null || raw === "") { cb.key = null; return; }
+    const t = raw instanceof Date ? raw.getTime() : Date.parse(raw);
+    cb.key = Number.isFinite(t) ? `${kind}:${t}` : `${kind}:${raw}`;
+  }
+  function combatOf(g) {
+    const party = getPiniaStore("party");
+    const pcs = party?.combatState;
+    const who = getPiniaStore("character")?.activeCharacter?.id ?? null;
+    if (pcs) {
+      const cb = { party: true, state: pcs, who,
+        zone: (g?.combatZones ?? []).find((z) => z.id === pcs.zoneId)
+          ?? (party.dungeonCatalog ?? []).find((z) => z.id === pcs.zoneId),
+        me: (pcs.players ?? []).find((p) => p.characterId === who) ?? null };
+      sessionOf("party", pcs, cb);
+      return cb;
+    }
     const cs = g?.combatState;
     if (!cs) return null;
-    const hp = cs.player?.currentHp ?? cs.currentHp;
-    const du = cs.deadUntil ? new Date(cs.deadUntil).getTime() : null;
-    if ((Number.isFinite(hp) && hp <= 0) || (du != null && du > nowMs))
-      return { reviveIn: du != null ? Math.max(0, (du - nowMs) / 1000) : null };
+    const cb = { party: false, state: cs, who, me: cs.player ?? null,
+      zone: (g.combatZones ?? []).find((z) => z.id === cs.zoneId) };
+    sessionOf("solo", cs, cb);
+    return cb;
+  }
+  const combatTitle = (cb) => cb.party
+    ? `⚔ 组队·${cb.zone?.name ?? (cb.state.zoneName || "战斗中")}（${cb.state.killCount != null
+      ? `击杀 ${cb.state.killCount}` : cb.state.waveNumber != null ? `波次 ${cb.state.waveNumber}` : "进行中"}）`
+    : `⚔ ${cb.zone?.name ?? "战斗中"}（击杀 ${cb.state.killCount ?? 0}）`;
+  function computeAlert(g, nowMs) {
+    const cb = combatOf(g);
+    if (!cb) return null;
+    const hp = cb.me?.currentHp ?? cb.state.currentHp;
+    const duRaw = cb.me?.deadUntil ?? cb.state.deadUntil;
+    const du = duRaw ? new Date(duRaw).getTime() : null;
+    if ((Number.isFinite(hp) && hp <= 0) || (du != null && du > nowMs) || cb.me?.isDead === true)
+      return { reviveIn: du != null ? Math.max(0, (du - nowMs) / 1000) : null, party: cb.party };
     return null;
   }
 
+  const MAX_GAP_MS = 120_000;
+  const GOLD_WARMUP_MS = 30_000;
+  const POTION_KEEP = 8;
+  const POTION_STAT_LS = "fishidle-hud.potionStat";
+  const POTION_LOW_LS = "fishidle-hud.potionLow";
+  const potionLowOf = (v) => (Number.isFinite(v) ? Math.min(1440, Math.max(0, Math.round(v))) : 10);
+  let potionLowMin = 10;
+  try { potionLowMin = potionLowOf(+(localStorage.getItem(POTION_LOW_LS) ?? 10)); } catch {}
+  const potionStat = new Map();
+  try {
+    for (const [k, v] of Object.entries(JSON.parse(localStorage.getItem(POTION_STAT_LS) || "{}")))
+      if (v && Number.isFinite(v.interval) && v.interval >= 0) potionStat.set(+k, { name: String(v.name ?? ""), interval: v.interval });
+  } catch {}
+  const persistPotionStat = () => { try { localStorage.setItem(POTION_STAT_LS, JSON.stringify(Object.fromEntries(potionStat))); } catch {} };
+  const RUN_STATE_SS = "fishidle-hud.combatRun";
+  const combatRun = { lastAt: 0, activeMs: 0, prevGold: null, loot: 0, seeded: 0, key: null, who: null, savedAt: 0, potions: null, uses: new Map() };
+  try {
+    const s = JSON.parse(sessionStorage.getItem(RUN_STATE_SS) || "null");
+    const legacy = s && s.goldBase != null && s.loot == null;
+    if (s && !legacy && Number.isFinite(s.lastAt) && s.lastAt > 0) {
+      combatRun.lastAt = s.lastAt; combatRun.activeMs = Math.max(0, s.activeMs || 0);
+      combatRun.prevGold = Number.isFinite(s.prevGold) ? s.prevGold : null;
+      combatRun.loot = Math.max(0, s.loot || 0);
+      combatRun.key = typeof s.key === "string" ? s.key : null; combatRun.who = s.who ?? null;
+      combatRun.seeded = Math.max(0, s.seeded || 0);
+    }
+  } catch {}
+  function saveCombatRun() {
+    const r = combatRun;
+    try { sessionStorage.setItem(RUN_STATE_SS, JSON.stringify({ key: r.key, who: r.who, prevGold: r.prevGold, loot: r.loot, seeded: r.seeded, activeMs: r.activeMs, lastAt: r.lastAt })); } catch {}
+  }
+  addEventListener("pagehide", () => { if (combatRun.key != null) saveCombatRun(); });
+  document.addEventListener("freeze", () => { if (combatRun.key != null) saveCombatRun(); });
+  const goldOf = (g) => (g.currencies ?? []).find((c) => c.currencyType === "Gold")?.amount ?? null;
+  const fixed1 = (x) => x.toFixed(1).replace(/\.0$/, "");
+  const fmtCompact = (n) => n >= 1e9 ? fixed1(n / 1e9) + "B" : n >= 1e6 ? fixed1(n / 1e6) + "M"
+    : n >= 1e4 ? fixed1(n / 1e3) + "K" : String(Math.round(n));
+
+  const seedOf = (cb) => (cb.party ? 0 : Number(cb.state.lootGold) || 0);
+  function stepCombatRun(g, cb, now) {
+    const r = combatRun;
+    if (!cb) {
+      const idle = goldOf(g); if (idle != null) r.prevGold = idle;
+      return;
+    }
+    const settling = !document.hidden || keepAlive.on;
+    if (cb.who != null && r.who != null && cb.who !== r.who) r.key = null;
+    r.who = cb.who ?? r.who;
+    if (cb.key !== r.key) {
+      r.activeMs = 0; r.loot = 0; r.prevGold = null; r.seeded = seedOf(cb); r.key = cb.key; r.lastAt = now;
+    }
+    const dt = now - r.lastAt;
+    if (settling && dt > 0 && dt <= MAX_GAP_MS) r.activeMs += dt;
+    r.lastAt = now;
+    const gold = goldOf(g);
+    if (gold != null) {
+      if (r.prevGold != null) { const d = gold - r.prevGold; if (d > 0) r.loot += d; }
+      r.prevGold = gold;
+    }
+    const pots = new Map();
+    for (const it of g.inventory ?? []) if (/^Potion/.test(it.category ?? "") && Number.isFinite(it.quantity))
+      pots.set(it.itemId, (pots.get(it.itemId) ?? 0) + it.quantity);
+    if (r.potions) for (const [id, prev] of r.potions)
+      if ((pots.get(id) ?? 0) === prev - 1) notePotionUse(id, g.inventory, now);
+    r.potions = pots;
+    if (now - r.savedAt >= 5000) { r.savedAt = now; saveCombatRun(); }
+  }
+  function notePotionUse(id, inventory, now) {
+    let times = combatRun.uses.get(id);
+    if (!times) combatRun.uses.set(id, times = []);
+    if (times.at(-1) === now) return;
+    times.push(now);
+    if (times.length > POTION_KEEP) times.shift();
+    const st = potionStat.get(id) ?? potionStat.set(id, { name: "", interval: 0 }).get(id);
+    if (!st.name) st.name = (inventory ?? []).find((it) => it.itemId === id)?.name ?? `#${id}`;
+    if (times.length < 2) return;
+    const fresh = (times.at(-1) - times[0]) / (times.length - 1) / 1000;
+    st.interval = st.interval > 0 ? st.interval * 0.6 + fresh * 0.4 : fresh;
+    persistPotionStat();
+  }
+  function combatMonitorRows() {
+    const r = combatRun, rows = [];
+    const warm = r.activeMs >= GOLD_WARMUP_MS;
+    rows.push({ label: "分均金币", value: `${warm ? fmtCompact(r.loot / (r.activeMs / 60000)) + "/分" : "统计中…"} · 本场 +${fmtCompact(r.loot + r.seeded)}`, accent: warm });
+    for (const [id, times] of r.uses) {
+      const qty = r.potions?.get(id) ?? 0, st = potionStat.get(id);
+      const fresh = times.length >= 2 && times.at(-1) > times[0] ? (times.at(-1) - times[0]) / (times.length - 1) / 1000 : null;
+      const interval = fresh ?? (st.interval > 0 ? st.interval : null), eta = qty * interval;
+      if (qty > 0 && interval == null) continue;
+      rows.push({ label: st.name, value: qty <= 0 ? "已耗尽" : `余 ${qty} · 耗尽 ${fmtDur(eta)}${fresh == null ? "（估）" : ""}`,
+        accent: qty <= 0 || (interval != null && eta < potionLowMin * 60), accentColor: qty <= 0 ? "#f87171" : "#e8b45a" });
+    }
+    return rows;
+  }
+
+  const lodgeCalc = { hub: null, tried: false, state: null, rows: [] };
+  function lodgeTap() {
+    if (lodgeCalc.tried) return;
+    lodgeCalc.tried = true;
+    try {
+      const url = [...new Set(performance.getEntriesByType("resource").map((e) => e.name))]
+        .find((u) => /\/hubManager-[A-Za-z0-9_-]+\.js$/.test(u));
+      if (!url) return;
+      import(url).then((mod) => {
+        const hub = Object.values(mod).find((m) => m && typeof m.getLodgeState === "function" && typeof m.onLodgeState === "function");
+        if (!hub) return;
+        lodgeCalc.hub = hub;
+        hub.onLodgeState((state) => { lodgeCalc.state = state; renderLodgeGaps(); });
+      }).catch(() => {});
+    } catch {}
+  }
+  function lodgeAsk() {
+    if (lodgeCalc.hub && !lodgeCalc.asked) { lodgeCalc.asked = true; try { lodgeCalc.hub.getLodgeState(); } catch {} }
+  }
+  const lodgeNum = (s) => { const m = String(s).match(/([\d.]+)([KMB])?/); return m ? Math.round(Number(m[1]) * ({ K: 1e3, M: 1e6, B: 1e9 }[m[2]] ?? 1)) : NaN; };
+  function lodgeRows() {
+    const rows = [...document.querySelectorAll(".lodge-panel .block-costs .cost-row")];
+    if (!rows.length) return null;
+    lodgeTap(); lodgeAsk();
+    const st = lodgeCalc.state;
+    let pack = null;
+    if (st) {
+      const facility = document.querySelector(".lodge-content .block--facility")
+        ? [...document.querySelectorAll(".lodge-panel .side-card--facility.active use")]
+          .map((u) => (u.getAttribute("href") ?? "").match(/svg-icon:([A-Za-z]+)/)?.[1]).find(Boolean) : null;
+      if (!facility && st.nextLodgeUpgrade) pack = st.nextLodgeUpgrade;
+      else for (const f of [...(st.facilities ?? []), ...(st.buildableFacilities ?? [])])
+        if (f.facilityType === facility && f.nextUpgrade) { pack = f.nextUpgrade; break; }
+    }
+    const gold = goldOf(getGameStore());
+    const inv = new Map();
+    for (const it of getGameStore()?.inventory ?? []) if ((it.enhancementLevel ?? 0) === 0) inv.set(it.itemId, (inv.get(it.itemId) ?? 0) + (it.quantity ?? 0));
+    return rows.map((row, i) => {
+      const num = (s) => { const m = String(s).match(/([\d.]+)([KMB])?/); return m ? Math.round(Number(m[1]) * ({ K: 1e3, M: 1e6, B: 1e9 }[m[2]] ?? 1)) : NaN; };
+      const [dep, req] = (row.querySelector(".cost-progress")?.textContent ?? "").split("/").map((x) => num(x));
+      const owned = num((row.querySelector(".cost-owned")?.textContent ?? "").replace(/[^\d.KMB]/g, ""));
+      const mat = pack?.materials?.[i - 1];
+      const exact = i > 0 && mat ? { req: mat.required, dep: mat.deposited, owned: inv.get(mat.itemId) ?? 0 }
+        : i === 0 ? { req: pack?.goldCost, dep: pack?.goldDeposited, owned: gold } : null;
+      const use = (exact, dom) => (Number.isFinite(exact) ? exact : Number.isFinite(dom) ? dom : NaN);
+      const required = use(exact?.req, req), deposited = use(exact?.dep, dep);
+      const own = i === 0 ? (Number.isFinite(gold) ? gold : owned) : use(exact?.owned, owned);
+      return { name: (row.querySelector(".cost-name")?.textContent ?? "").trim(),
+        gap: Math.max(0, Math.round(required - deposited - own) || 0),
+        approx: !Number.isFinite(required) || !Number.isFinite(deposited), itemId: mat?.itemId ?? null };
+    });
+  }
+  function renderLodgeGaps() {
+    if (!modules.lodge) return;
+    const rows = document.querySelectorAll(".lodge-panel .block-costs .cost-row");
+    if (!rows.length) return;
+    lodgeCalc.rows = lodgeRows() ?? [];
+    lodgeAsk();
+    rows.forEach((row, i) => {
+      const info = lodgeCalc.rows[i], meta = row.querySelector(".cost-meta");
+      if (!info || !meta) return;
+      let el = meta.querySelector(".fh-lodge-gap");
+      if (!el) { el = document.createElement("span"); el.className = "fh-lodge-gap"; el.style.cssText = "font-weight:700;white-space:nowrap;"; meta.appendChild(el); }
+      el.textContent = info.gap > 0 ? `还差 ${info.approx ? "≈" : ""}${fmtCompact(info.gap)}` : "已备齐";
+      el.style.color = info.gap > 0 ? "#e8b45a" : "#7fd4a0";
+    });
+  }
   const KA_LS = "fishidle-hud.keepalive";
   const keepAlive = {
     on: (() => { try { return localStorage.getItem(KA_LS) === "1"; } catch { return false; } })(),
@@ -331,6 +523,8 @@
     if (!g) return { status: "等待游戏加载…", sections: [], empty: null, alert: null };
     hookStore(g);
     const now = Date.now();
+    const cb = combatOf(g);
+    stepCombatRun(g, cb, now);
     const cs = String(g.connectionStatus ?? "").toLowerCase();
     let status = cs && cs !== "connected"
       ? `⚠ 连接: ${g.connectionStatus}`
@@ -372,12 +566,10 @@
           else if (Number.isFinite(cur.remainingCount))
             rows.push({ label: "剩余", value: `${cur.remainingCount} 次` });
         }
-      } else if (g.combatState) {
-        const zone = (g.combatZones ?? []).find((z) => z.id === g.combatState.zoneId);
-        rows.push({ label: "战斗", value: `⚔ ${zone?.name ?? "战斗中"}（击杀 ${g.combatState.killCount ?? 0}）`, accent: true });
-      } else {
-        rows.push({ label: "状态", value: "空闲" });
       }
+      if (cb) rows.push({ label: "战斗", value: combatTitle(cb), accent: true });
+      else if (!cur) rows.push({ label: "状态", value: "空闲" });
+      if (cb) for (const row of combatMonitorRows()) rows.push(row);
       parts.push({ title: "当前", rows });
     }
 
@@ -395,12 +587,12 @@
       const sumTxt = known ? (known < q.length ? "≥ " : "") + fmtDur(total) : (hasInf ? "" : "—");
       rows.push({ label: `合计（${q.length}/${g.maxQueueSlots ?? "?"}）`, value: sumTxt + (hasInf ? "＋∞" : "") });
       if (g.queueLoopEnabled) rows.push({ label: "循环模式", value: "开启" });
-      parts.push({ title: g.combatState ? "队列（战斗结束后执行）" : "队列", rows });
+      parts.push({ title: cb ? "队列（战斗结束后执行）" : "队列", rows });
     }
 
     const curSkill = (isEnhancementActivity(cur) || isAlchemyActivity(cur)) ? null
       : (cur ? (cur.skillType ?? cur.craftingProfession ?? null) : null);
-    const inCombat = !!g.combatState;
+    const inCombat = !!cb;
     const upRows = [];
     for (const key of ["skills", "combatSkills"]) {
       for (const s of g[key] ?? []) {
@@ -1173,6 +1365,7 @@
     { key: "calc", label: "发育计算器", desc: "左侧栏的发育入口" },
     { key: "fav", label: "收藏夹", desc: "左侧栏的收藏入口，以及对话框和计算器里的收藏按钮" },
     { key: "dialog", label: "对话框增强", desc: "开始制造 / 采集 / 炼金对话框里的升级次数和预计时间" },
+    { key: "lodge", label: "渔舍计算器", desc: "渔舍页显示每个材料的差额（需求 − 已填入 − 背包）" },
   ];
   const modules = Object.fromEntries(MODULES.map((m) => [m.key, true]));
   try {
@@ -1236,8 +1429,20 @@
           <input class="settings-check" type="checkbox" data-fh-module="${m.key}"${modules[m.key] ? " checked" : ""}>
           <span ${sc}><strong ${sc}>${m.label}</strong><span class="hint" style="display:block;margin-top:2px;" ${sc}>${m.desc}</span></span>
         </label>`).join("")}
+        <label class="field-row" ${sc}>
+          <span class="field-label" ${sc}>药水告警阈值（分钟）</span>
+          <input class="input" type="number" min="0" max="1440" step="1" data-fh-potion-low value="${potionLowMin}" ${sc}>
+        </label>
+        <p class="hint" ${sc}>战斗中药水的耗尽时间低于它时在面板里标黄，0 表示不提醒。</p>
       </section>`;
-    pane.addEventListener("change", (e) => { const k = e.target.dataset.fhModule; if (k in modules) setModule(k, e.target.checked); });
+    pane.addEventListener("change", (e) => {
+      const k = e.target.dataset.fhModule;
+      if (k in modules) { setModule(k, e.target.checked); return; }
+      if (e.target.dataset.fhPotionLow == null) return;
+      potionLowMin = Number.isNaN(e.target.valueAsNumber) ? potionLowMin : potionLowOf(e.target.valueAsNumber);
+      e.target.value = potionLowMin;
+      try { localStorage.setItem(POTION_LOW_LS, String(potionLowMin)); } catch {}
+    });
     content.appendChild(pane);
   }
   document.addEventListener("click", (e) => {
@@ -1300,6 +1505,7 @@
     if (!document.hidden && modules.hud) renderDom(m);
     renderPip(m);
     if (keepAlive.on && document.hidden) { try { getPiniaStore("combatVfx")?.prune?.(); } catch {} }
+    if (modules.lodge) renderLodgeGaps();
   }
   function startUi() {
     applyModules();
