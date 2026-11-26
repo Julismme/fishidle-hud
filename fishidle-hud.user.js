@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.0.20261126
+// @version      1.1.1.20261126
 // @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
 // @author      jojo
 // @match        https://fishidle.com/game/*
@@ -13,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.0.20261126";
+  const VERSION = "1.1.1.20261126";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -323,21 +323,20 @@
   } catch {}
   const persistPotionStat = () => { try { localStorage.setItem(POTION_STAT_LS, JSON.stringify(Object.fromEntries(potionStat))); } catch {} };
   const RUN_STATE_SS = "fishidle-hud.combatRun";
-  const combatRun = { lastAt: 0, activeMs: 0, prevGold: null, loot: 0, seeded: 0, key: null, who: null, savedAt: 0, potions: null, uses: new Map() };
+  const combatRun = { lastAt: 0, activeMs: 0, prevGold: null, loot: 0, key: null, who: null, savedAt: 0, potions: null, uses: new Map() };
   try {
     const s = JSON.parse(sessionStorage.getItem(RUN_STATE_SS) || "null");
-    const legacy = s && s.goldBase != null && s.loot == null;
+    const legacy = s && s.goldBase != null && s.lootBase == null;
     if (s && !legacy && Number.isFinite(s.lastAt) && s.lastAt > 0) {
       combatRun.lastAt = s.lastAt; combatRun.activeMs = Math.max(0, s.activeMs || 0);
       combatRun.prevGold = Number.isFinite(s.prevGold) ? s.prevGold : null;
       combatRun.loot = Math.max(0, s.loot || 0);
       combatRun.key = typeof s.key === "string" ? s.key : null; combatRun.who = s.who ?? null;
-      combatRun.seeded = Math.max(0, s.seeded || 0);
     }
   } catch {}
   function saveCombatRun() {
     const r = combatRun;
-    try { sessionStorage.setItem(RUN_STATE_SS, JSON.stringify({ key: r.key, who: r.who, prevGold: r.prevGold, loot: r.loot, seeded: r.seeded, activeMs: r.activeMs, lastAt: r.lastAt })); } catch {}
+    try { sessionStorage.setItem(RUN_STATE_SS, JSON.stringify({ key: r.key, who: r.who, prevGold: r.prevGold, loot: r.loot, activeMs: r.activeMs, lastAt: r.lastAt })); } catch {}
   }
   addEventListener("pagehide", () => { if (combatRun.key != null) saveCombatRun(); });
   document.addEventListener("freeze", () => { if (combatRun.key != null) saveCombatRun(); });
@@ -346,7 +345,6 @@
   const fmtCompact = (n) => n >= 1e9 ? fixed1(n / 1e9) + "B" : n >= 1e6 ? fixed1(n / 1e6) + "M"
     : n >= 1e4 ? fixed1(n / 1e3) + "K" : String(Math.round(n));
 
-  const seedOf = (cb) => (cb.party ? 0 : Number(cb.state.lootGold) || 0);
   function stepCombatRun(g, cb, now) {
     const r = combatRun;
     if (!cb) {
@@ -357,15 +355,21 @@
     if (cb.who != null && r.who != null && cb.who !== r.who) r.key = null;
     r.who = cb.who ?? r.who;
     if (cb.key !== r.key) {
-      r.activeMs = 0; r.loot = 0; r.prevGold = null; r.seeded = seedOf(cb); r.key = cb.key; r.lastAt = now;
+      r.activeMs = 0; r.loot = 0; r.prevGold = null; r.key = cb.key; r.lastAt = now;
     }
     const dt = now - r.lastAt;
     if (settling && dt > 0 && dt <= MAX_GAP_MS) r.activeMs += dt;
     r.lastAt = now;
-    const gold = goldOf(g);
-    if (gold != null) {
-      if (r.prevGold != null) { const d = gold - r.prevGold; if (d > 0) r.loot += d; }
-      r.prevGold = gold;
+    if (cb.party) {
+      const gold = goldOf(g);
+      if (gold != null) {
+        if (r.prevGold != null) { const d = gold - r.prevGold; if (d > 0) r.loot += d; }
+        r.prevGold = gold;
+      }
+    } else {
+      r.loot = Number(cb.state.lootGold) || 0;
+      const started = cb.state.startedAt ? Date.parse(cb.state.startedAt) : NaN;
+      if (Number.isFinite(started)) r.activeMs = Math.max(0, now - started);
     }
     const pots = new Map();
     for (const it of g.inventory ?? []) if (/^Potion/.test(it.category ?? "") && Number.isFinite(it.quantity))
@@ -391,7 +395,7 @@
   function combatMonitorRows() {
     const r = combatRun, rows = [];
     const warm = r.activeMs >= GOLD_WARMUP_MS;
-    rows.push({ label: "分均金币", value: `${warm ? fmtCompact(r.loot / (r.activeMs / 60000)) + "/分" : "统计中…"} · 本场 +${fmtCompact(r.loot + r.seeded)}`, accent: warm });
+    rows.push({ label: "分均金币", value: `${warm ? fmtCompact(r.loot / (r.activeMs / 60000)) + "/分" : "统计中…"} · 本场 +${fmtCompact(r.loot)}`, accent: warm });
     for (const [id, times] of r.uses) {
       const qty = r.potions?.get(id) ?? 0, st = potionStat.get(id);
       const fresh = times.length >= 2 && times.at(-1) > times[0] ? (times.at(-1) - times[0]) / (times.length - 1) / 1000 : null;
