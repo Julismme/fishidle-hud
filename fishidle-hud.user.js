@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.2.20261126
+// @version      1.1.3.20261126
 // @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
 // @author      jojo
 // @match        https://fishidle.com/game/*
@@ -13,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.2.20261126";
+  const VERSION = "1.1.3.20261126";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -783,6 +783,28 @@
     }
   }
 
+  const LIFE_XP_CUM = [
+    0,180,360,540,720,996,1272,1548,1824,2123,
+    2560,3158,3917,4883,6102,8038,10370,13186,16530,20446,
+    25330,30962,37430,44822,53226,62730,73422,85390,98766,113594,
+    133265,154911,178690,204760,233200,265985,301535,340008,381562,426355,
+    474545,526211,581511,640603,703566,780678,868126,966726,1077294,1200646,
+    1345486,1505830,1682766,1877246,2090222,2322918,2576422,2851686,3149934,3472254,
+    3937554,4438274,4975734,5551694,6167474,6859594,7597034,8381554,9214694,10098214,
+    11033654,12022554,13066674,14167334,15326294,16636942,18013676,19458226,20971976,22556656,
+    24297036,26079282,27903394,29769026,31676524,33625542,35615734,37647100,39719294,41831970,
+    43985128,46178422,48411852,50684726,52997044,55348460,57738628,60167202,62633836,65138184,
+    67679900,70258984,72874744,75526834,78214908,80938620,83697624,86491574,89320124,92182928,
+    95079640,98009914,100973404,103969418,106997956,110058326,113150528,116273870,119428352,122613282,
+    125828660,129073794,132348684,135652638,138985310,142346700,145736116,149153558,152598680,156070790,
+    159569888,163095628,166647664,170225650,173829240,177458434,181112540,184791558,188495142,192222946,
+    195974624,199750176,203549256,207371518,211216616,215084550,218974974,222887542,226822254,230778418,
+    234756380,238755448,242775622,246816556,250878250,254960358,259062534,263184778,267327090,271488778,
+    275670188,279870628,284090098,288328598,292585782,296861650,301155856,305468054,309798590,314146772,
+    318512946,322896420,327297540,331715960,336151334,340603662,345072944,349558834,354061332,358580438,
+    363115806,367667436,372234982,376818444,381417822,386033116,390663980,395310068,399971726,404648608,
+    409340714,414047698,418769906,423506992,428258610,433025106,437806134,442601348,447411094,452235026,
+  ];
   const FH_INFO_ID = "fh-craft-level-info";
   function enhanceStartDialog() {
     if (!modules.dialog) return;
@@ -794,7 +816,7 @@
       delete dlg.dataset.fhItem;
       return;
     }
-    const gm = text.match(/开始采集\s*[×x]\s*([^\s]+)/);
+    const gm = text.match(/开始(?:采集|钓鱼|伐木|采矿)\s*[×x]\s*([^\s]+)/);
     const am = text.match(/开始炼金\s*[×x]\s*([^\s]+)/);
     const m = gm ?? am ?? text.match(/开始(?!采集|战斗|炼金)[^×\s]*\s*[×x]\s*([^\s]+)/);
     if (!m) { document.getElementById(FH_INFO_ID)?.remove(); return; }
@@ -815,44 +837,74 @@
 
     const g = getGameStore();
     const recipe = !isGather && !isAlchemy ? (g?.craftingRecipes ?? []).find((r) => r.craftedItemName === itemName) : null;
-    const resource = isGather ? (g?.resources ?? []).find((r) => r.name === itemName) : null;
-    const ax = isAlchemy ? craftXp.get("Alchemy") : null;
-    const cx = recipe && craftXp.get(recipe.profession);
+    let resource = isGather ? (g?.resources ?? []).find((r) => r.name === itemName) : null;
+    if (isGather && !resource) {
+      const loc = (g?.locations ?? []).find((l) => l.name === itemName);
+      const atLoc = loc ? (g?.resources ?? []).filter((r) => r.locationId === loc.id) : [];
+      resource = atLoc.sort((a, b) => (a.tier ?? 1) - (b.tier ?? 1))[0] ?? null;
+    }
+    const ax = isAlchemy ? (g?.craftingSkillLevels?.Alchemy ?? craftXp.get("Alchemy")) : null;
+    const cx = recipe ? (g?.craftingSkillLevels?.[recipe.profession] ?? craftXp.get(recipe.profession)) : null;
     const host = document.createElement("div");
     host.id = FH_INFO_ID;
     host.style.cssText = `margin:8px 0;padding:8px 10px;border-radius:8px;font-size:12px;line-height:1.7;
       background:rgba(120,160,255,.08);border:1px dashed rgba(120,160,255,.35);color:inherit;`;
     const dlgRow = (k, v, accent) => fhRow(k, v, { accent, accentColor: "#4ade80", bold: true, gap: 16, lo: ".7" });
-    if (isGather && !resource) {
-      host.innerHTML = dlgRow("FishIdle HUD", "未找到资源数据");
-    } else if (isGather) {
+    let si = null;
+    if (isGather && resource) {
       const st = resource.skillType;
       const sk = (g?.skills ?? []).find((s) => s.skillType === st);
       const gx = gatherXp.get(st + "|" + resource.id);
-      if (!sk || !(sk.nextLevelExp > 0)) host.innerHTML = dlgRow("FishIdle HUD", "未找到技能数据");
-      else {
-        const per = gx?.per > 0 ? gx.per : gatherXpPer(resource.tier, sk.level);
-        const t = Number.isFinite(gx?.tick) && gx.tick > 0 ? gx.tick
-          : gatherInterval(resource.tier, sk.level, gatherToolTier(g, st));
-        const times = Math.max(0, Math.ceil((sk.nextLevelExp - sk.experience) / per));
-        host.innerHTML =
-          dlgRow(`升级所需次数（${zh(st)} Lv.${sk.level}，${sk.experience}/${sk.nextLevelExp} xp，每次 +${per}）`, `${times} 次`, true) +
-          dlgRow("升级预计时间（单次 ≈ " + (+t).toFixed(1) + " 秒）", "≈ " + fmtDur(times * t), true);
-      }
+      if (sk && sk.nextLevelExp > 0) si = { lv: sk.level, xp: sk.experience, next: sk.nextLevelExp,
+        per: gx?.per > 0 ? gx.per : gatherXpPer(resource.tier, sk.level),
+        t: Number.isFinite(gx?.tick) && gx.tick > 0 ? gx.tick : gatherInterval(resource.tier, sk.level, gatherToolTier(g, st)),
+        label: `${zh(st)} Lv.${sk.level}` };
+    } else if (recipe) {
+      const cs = g?.craftingSkillLevels?.[recipe.profession];
+      const cx2 = craftXp.get(recipe.profession);
+      const lv = cs ? cs.level : cx2?.lv ?? null;
+      const xp = cs ? cs.experience : cx2?.xp ?? 0;
+      const next = cs ? cs.nextLevelExp : cx2?.next;
+      if (lv != null && next > 0) si = { lv, xp, next, per: recipe.xpPerCraft,
+        t: Number.isFinite(recipe.baseTickIntervalSeconds) ? recipe.baseTickIntervalSeconds : null,
+        label: `${zh(recipe.profession)} Lv.${lv}` };
     } else if (isAlchemy) {
-      host.innerHTML = ax
-        ? dlgRow(`炼金 Lv.${ax.lv ?? "?"}（${ax.xp}/${ax.next} xp）`, "单次经验待采样", true)
-        : dlgRow("炼金升级预估", "先生产一次以采样经验数据");
-    } else if (!recipe) {
-      host.innerHTML = dlgRow("FishIdle HUD", "未找到配方数据");
-    } else if (!cx || !Number.isFinite(cx.next) || !Number.isFinite(cx.xp) || !(recipe.xpPerCraft > 0)) {
-      host.innerHTML = dlgRow("升级预估", "本次会话未生产过该职业，暂无经验数据");
+      const cs = g?.craftingSkillLevels?.Alchemy;
+      const lv = cs ? cs.level : ax?.lv ?? null;
+      const xp = cs ? cs.experience : ax?.xp ?? 0;
+      const next = cs ? cs.nextLevelExp : ax?.next;
+      if (lv != null && next > 0) si = { lv, xp, next, per: null, t: null, label: `炼金 Lv.${lv}` };
+    }
+    const lifeCum = (lv) => (lv >= 1 && lv <= LIFE_XP_CUM.length ? LIFE_XP_CUM[lv - 1] : null);
+    const rowsFor = (target) => {
+      if (!si) return "";
+      const need = Math.max(0, (lifeCum(target) ?? 0) - (lifeCum(si.lv) ?? 0) - si.xp);
+      const times = si.per ? Math.ceil(need / si.per) : null;
+      const out = [dlgRow(`升到 Lv.${target}（还需 ${fmtCompact(need)} xp）`, si.per ? `${times} 次` : "单次经验待采样", true)];
+      if (si.per && si.t) out.push(dlgRow(`预计时间（单次 ≈ ${(+si.t).toFixed(1)} 秒）`, "≈ " + fmtDur(times * si.t), true));
+      return out.join("");
+    };
+    if (!si) {
+      host.innerHTML = isGather ? dlgRow("FishIdle HUD", resource ? "未找到技能数据" : "未找到资源数据")
+        : recipe ? dlgRow("升级预估", "本次会话未生产过该职业，暂无经验数据")
+        : isAlchemy ? dlgRow("炼金升级预估", "先生产一次以采样经验数据")
+        : dlgRow("FishIdle HUD", "未找到配方数据");
     } else {
-      const t = Number.isFinite(recipe.baseTickIntervalSeconds) ? recipe.baseTickIntervalSeconds : null;
-      const crafts = Math.max(0, Math.ceil((cx.next - cx.xp) / recipe.xpPerCraft));
-      host.innerHTML =
-        dlgRow(`升级所需次数（${zh(recipe.profession)} Lv.${cx.lv}，${cx.xp}/${cx.next} xp）`, `${crafts} 次`, true) +
-        (t ? dlgRow("升级预计时间（单次 ≈ " + (+t).toFixed(1) + " 秒）", "≈ " + fmtDur(crafts * t), true) : "");
+      host.innerHTML = `<div class="fh-rows"></div>
+        <label style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:12px;">
+          <span style="opacity:.7;">目标等级</span>
+          <input class="fh-target" type="number" min="${si.lv + 1}" max="${LIFE_XP_CUM.length}" step="1" value="${si.lv + 1}"
+            style="all:unset;width:56px;text-align:center;padding:2px 4px;border:1px solid rgba(120,160,255,.35);border-radius:6px;background:rgba(120,160,255,.08);color:inherit;">
+          <span style="opacity:.55;">按游戏帮助的生活技能经验表计算</span>
+        </label>`;
+      const rowsEl = host.querySelector(".fh-rows");
+      const targetInp = host.querySelector(".fh-target");
+      const render = (t) => { rowsEl.innerHTML = rowsFor(t); };
+      targetInp.addEventListener("input", () => {
+        const n = Math.round(+targetInp.value);
+        if (Number.isFinite(n)) render(Math.min(LIFE_XP_CUM.length, Math.max(si.lv + 1, n)));
+      });
+      render(si.lv + 1);
     }
     if (modules.fav && (recipe || resource)) {
       const favBtn = document.createElement("button");
