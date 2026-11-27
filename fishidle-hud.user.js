@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.6.20261127
+// @version      1.1.7.20261127
 // @description  fishidle.com 辅助面板：队列倒计时、升级预估（采集/炼金直算）、战斗监控（分均金币/药剂提醒）、生活药剂监控、死亡告警、收藏、对话框与卡片增强、发育计算器、渔舍计算器。
 // @author      jojo
 // @match        https://fishidle.com/game/*
@@ -13,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.6.20261127";
+  const VERSION = "1.1.7.20261127";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -368,7 +368,7 @@
       if ((pots.get(id) ?? 0) === prev - 1) notePotionUse(id, g.inventory, now);
     r.potions = pots;
   }
-  function notePotionUse(id, inventory, now, uses = combatRun.uses) {
+  function notePotionUse(id, inventory, now, uses = combatRun.uses, ema = true) {
     let times = uses.get(id);
     if (!times) uses.set(id, times = []);
     if (times.at(-1) === now) return;
@@ -376,7 +376,7 @@
     if (times.length > POTION_KEEP) times.shift();
     const st = potionStat.get(id) ?? potionStat.set(id, { name: "", interval: 0 }).get(id);
     if (!st.name) st.name = (inventory ?? []).find((it) => it.itemId === id)?.name ?? `#${id}`;
-    if (times.length < 2) return;
+    if (!ema || times.length < 2) { persistPotionStat(); return; }
     const fresh = (times.at(-1) - times[0]) / (times.length - 1) / 1000;
     st.interval = st.interval > 0 ? st.interval * 0.6 + fresh * 0.4 : fresh;
     persistPotionStat();
@@ -398,38 +398,53 @@
 
   const LIFE_POTION_DEFAULT_SEC = 300;
   const lifePotions = { act: null, potions: null, uses: new Map() };
-  const potionSlots = { hub: null, tried: false, askedAt: 0, slots: null };
+  const potionSlots = { hub: null, tried: false, askedAt: 0, prof: null, slots: null };
+  function lifeProfessionOf(cur) {
+    if (!cur) return null;
+    if (isAlchemyActivity(cur)) return "Alchemy";
+    return cur.craftingProfession ?? cur.skillType ?? null;
+  }
   const normSlotList = (d) => {
     const ms = (v) => { const t = v instanceof Date ? v.getTime() : Date.parse(v ?? ""); return Number.isFinite(t) ? t : null; };
     const arr = Array.isArray(d) ? d : Array.isArray(d?.slots) ? d.slots : Array.isArray(d?.items) ? d.items : null;
     return arr ? arr.filter((s) => s?.itemId != null).map((s) => ({ itemId: s.itemId, name: s.itemName ?? s.name ?? null,
       effectDuration: Number(s.effectDuration) > 0 ? Number(s.effectDuration) : null,
-      startedAtMs: ms(s.currentPotionStartedAt) })) : null;
+      startedAtMs: ms(s.currentPotionStartedAt),
+      qty: Number.isFinite(+s.inventoryQuantity) ? +s.inventoryQuantity : null })) : null;
   };
   function potionHubTap() {
     if (potionSlots.tried) return;
     potionSlots.tried = true;
-    hubClientWith(["getLifePotionSlots", "onLifePotionSlotsUpdated"], (hub) => {
-      potionSlots.hub = hub;
-      hub.onLifePotionSlotsUpdated((slots) => { const s = normSlotList(slots); if (s) potionSlots.slots = s; });
-    });
+    hubClientWith(["getLifePotionSlots"], (hub) => { potionSlots.hub = hub; });
   }
-  function potionSlotsAsk() {
+  function potionSlotsAsk(prof) {
     potionHubTap();
-    if (!potionSlots.hub) return;
+    if (!potionSlots.hub || !prof) return;
+    if (potionSlots.prof !== prof) { potionSlots.prof = prof; potionSlots.slots = null; }
     const since = Date.now() - potionSlots.askedAt;
     if (potionSlots.slots != null ? since < 60000 : since < 15000) return;
     potionSlots.askedAt = Date.now();
-    try { Promise.resolve(potionSlots.hub.getLifePotionSlots()).then((d) => {
-      const s = normSlotList(d); if (s) potionSlots.slots = s;
+    try { Promise.resolve(potionSlots.hub.getLifePotionSlots(prof)).then((d) => {
+      const s = normSlotList(d); if (s) applySlotUpdate(s);
     }).catch(() => {}); } catch {}
+  }
+  function applySlotUpdate(slots) {
+    const prev = potionSlots.slots;
+    potionSlots.slots = slots;
+    if (!lifePotions.act) return;
+    for (const s of slots) {
+      if (s.startedAtMs == null) continue;
+      const before = prev?.find((p) => p.itemId === s.itemId);
+      if (before?.startedAtMs != null && s.startedAtMs > before.startedAtMs)
+        notePotionUse(s.itemId, getGameStore()?.inventory ?? [], s.startedAtMs, lifePotions.uses, false);
+    }
   }
   function stepLifePotions(g, cb, now) {
     const cur = cb ? null : g.currentActivity;
     const active = cur && !isEnhancementActivity(cur);
     if (!active) { lifePotions.act = null; lifePotions.potions = null; lifePotions.uses.clear(); return; }
     if (lifePotions.act !== cur) { lifePotions.act = cur; lifePotions.potions = null; lifePotions.uses.clear(); }
-    potionSlotsAsk();
+    potionSlotsAsk(lifeProfessionOf(cur));
     const slots = potionSlots.slots;
     const watch = slots ? new Set(slots.map((s) => s.itemId)) : null;
     const snap = new Map();
@@ -444,13 +459,15 @@
   function lifePotionRows(g, now) {
     if (!lifePotions.act) return [];
     const inv = g.inventory ?? [], rows = [];
-    const qtyOf = (id) => lifePotions.potions?.get(id) ?? 0;
     const nameOf = (id) => potionStat.get(id)?.name || inv.find((it) => it.itemId === id)?.name || `#${id}`;
     const durOf = new Map((potionSlots.slots ?? []).filter((s) => s.effectDuration > 0).map((s) => [s.itemId, s.effectDuration]));
+    const slotQty = new Map((potionSlots.slots ?? []).filter((s) => s.qty != null).map((s) => [s.itemId, s.qty]));
+    const qtyOf = (id) => slotQty.get(id) ?? lifePotions.potions?.get(id) ?? 0;
     const rowOf = (id, interval, fresh) => {
       const st = potionStat.get(id);
-      const iv = interval ?? durOf.get(id) ?? (st?.interval > 0 ? st.interval : LIFE_POTION_DEFAULT_SEC);
-      const qty = qtyOf(id), eta = qty * iv, est = fresh == null;
+      const serverDur = durOf.get(id) != null;
+      const iv = durOf.get(id) ?? (interval ?? (st?.interval > 0 ? st.interval : null)) ?? LIFE_POTION_DEFAULT_SEC;
+      const qty = qtyOf(id), eta = qty * iv, est = !serverDur && interval == null;
       return { label: nameOf(id), value: qty <= 0 ? "已耗尽" : `余 ${qty} · 耗尽 ${fmtDur(eta)}${est ? "（估）" : ""}`,
         accent: qty <= 0 || eta < potionLowMin * 60, accentColor: qty <= 0 ? "#f87171" : "#e8b45a" };
     };
@@ -460,10 +477,11 @@
     }
     for (const s of potionSlots.slots ?? []) {
       if (lifePotions.uses.has(s.itemId) || qtyOf(s.itemId) <= 0) continue;
-      const started = s.startedAtMs != null ? Math.max(0, s.effectDuration - (now - s.startedAtMs) / 1000) : null;
+      const dur = s.effectDuration ?? LIFE_POTION_DEFAULT_SEC;
+      const started = s.startedAtMs != null ? Math.max(0, dur - (now - s.startedAtMs) / 1000) : dur;
       const qty = qtyOf(s.itemId);
-      const eta = (started ?? s.effectDuration ?? LIFE_POTION_DEFAULT_SEC) + Math.max(0, qty - 1) * (s.effectDuration ?? LIFE_POTION_DEFAULT_SEC);
-      rows.push({ label: nameOf(s.itemId), value: `余 ${qty} · 耗尽 ≈ ${fmtDur(eta)}（估）`,
+      const eta = started + Math.max(0, qty - 1) * dur;
+      rows.push({ label: nameOf(s.itemId), value: `余 ${qty} · 耗尽 ≈ ${fmtDur(eta)}`,
         accent: eta < potionLowMin * 60, accentColor: "#e8b45a" });
     }
     return rows;
