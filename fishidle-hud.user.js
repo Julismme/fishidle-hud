@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FishIdle HUD
 // @namespace    fishidle-plugin
-// @version      1.1.3.20261126
-// @description  fishidle.com 辅助面板：队列倒计时、升级预估、战斗监控（分均金币/药剂差额提醒）、死亡告警、收藏、发育计算器、渔舍计算器。
+// @version      1.1.6.20261127
+// @description  fishidle.com 辅助面板：队列倒计时、升级预估（采集/炼金直算）、战斗监控（分均金币/药剂提醒）、生活药剂监控、死亡告警、收藏、对话框与卡片增强、发育计算器、渔舍计算器。
 // @author      jojo
 // @match        https://fishidle.com/game/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 
 (() => {
   "use strict";
-  const VERSION = "1.1.3.20261126";
+  const VERSION = "1.1.6.20261127";
   if (window.__FISHIDLE_HUD__) return;
   window.__FISHIDLE_HUD__ = true;
 
@@ -31,8 +31,9 @@
     for (const [k, v] of JSON.parse(localStorage.getItem(CRAFT_XP_LS) || "[]")) craftXp.set(k, v);
   } catch {}
   function persistCraftXp() {
-    try { localStorage.setItem(CRAFT_XP_LS, JSON.stringify([...craftXp])); } catch {}
+    try { localStorage.setItem(CRAFT_XP_LS, JSON.stringify([...craftXp].map(([k, v]) => [k, { ...v, per: undefined, tick: undefined }]))); } catch {}
   }
+  let alchemyPrev = null;
   const GATHER_XP_LS = "fishidle-hud.gatherXp";
   const gatherXp = new Map();
   try {
@@ -102,7 +103,15 @@
         g.applyAlchemyTick = function (p) {
           try {
             const rec = parseCraftTick(p, isAlchemyActivity(g.currentActivity) ? "Alchemy" : null);
-            if (rec) { craftXp.set(rec.prof, rec); persistCraftXp(); }
+            if (rec) {
+              const aid = g.currentActivity?.alchemyItemId ?? null;
+              if (alchemyPrev && alchemyPrev.aid === aid && rec.xp > alchemyPrev.xp && rec.at > alchemyPrev.at) {
+                rec.per = rec.xp - alchemyPrev.xp;
+                rec.tick = Math.round((rec.at - alchemyPrev.at) / 100) / 10;
+              }
+              alchemyPrev = { aid, xp: rec.xp, at: rec.at };
+              craftXp.set(rec.prof, rec); persistCraftXp();
+            }
           } catch {}
           return origAl.apply(this, arguments);
         };
@@ -174,6 +183,21 @@
     return { r, timePerCraft, mats, possible, planned: plannedRaw, actual,
       short: Number.isFinite(planned) && possible < planned,
       eta: actual * timePerCraft };
+  }
+  function gatherDirectRate(g, cur) {
+    if (!cur || cur.skillType == null || (cur.resourceId == null && cur.locationId == null)) return null;
+    const st = cur.skillType;
+    const gx = cur.resourceId != null ? gatherXp.get(st + "|" + cur.resourceId) : null;
+    let res = (g?.resources ?? []).find((r) => r.id === cur.resourceId) ?? null;
+    if (!res && cur.locationId != null)
+      res = (g?.resources ?? []).filter((r) => r.locationId === cur.locationId)
+        .sort((a, b) => (a.tier ?? 1) - (b.tier ?? 1))[0] ?? null;
+    const level = (g?.skills ?? []).find((s) => s.skillType === st)?.level ?? 1;
+    const per = gx?.per > 0 ? gx.per : res ? gatherXpPer(res.tier, level) : null;
+    const t = Number.isFinite(cur.tickIntervalSeconds) && cur.tickIntervalSeconds > 0 ? cur.tickIntervalSeconds
+      : gx?.tick > 0 ? gx.tick
+      : res ? gatherInterval(res.tier, level, gatherToolTier(g, st)) : null;
+    return per > 0 && t > 0 ? { ty: st, xpPerSec: per / t } : null;
   }
   const fmtDur = (sec) => {
     if (!Number.isFinite(sec) || sec < 0) return "—";
@@ -344,9 +368,9 @@
       if ((pots.get(id) ?? 0) === prev - 1) notePotionUse(id, g.inventory, now);
     r.potions = pots;
   }
-  function notePotionUse(id, inventory, now) {
-    let times = combatRun.uses.get(id);
-    if (!times) combatRun.uses.set(id, times = []);
+  function notePotionUse(id, inventory, now, uses = combatRun.uses) {
+    let times = uses.get(id);
+    if (!times) uses.set(id, times = []);
     if (times.at(-1) === now) return;
     times.push(now);
     if (times.length > POTION_KEEP) times.shift();
@@ -372,21 +396,98 @@
     return rows;
   }
 
+  const LIFE_POTION_DEFAULT_SEC = 300;
+  const lifePotions = { act: null, potions: null, uses: new Map() };
+  const potionSlots = { hub: null, tried: false, askedAt: 0, slots: null };
+  const normSlotList = (d) => {
+    const ms = (v) => { const t = v instanceof Date ? v.getTime() : Date.parse(v ?? ""); return Number.isFinite(t) ? t : null; };
+    const arr = Array.isArray(d) ? d : Array.isArray(d?.slots) ? d.slots : Array.isArray(d?.items) ? d.items : null;
+    return arr ? arr.filter((s) => s?.itemId != null).map((s) => ({ itemId: s.itemId, name: s.itemName ?? s.name ?? null,
+      effectDuration: Number(s.effectDuration) > 0 ? Number(s.effectDuration) : null,
+      startedAtMs: ms(s.currentPotionStartedAt) })) : null;
+  };
+  function potionHubTap() {
+    if (potionSlots.tried) return;
+    potionSlots.tried = true;
+    hubClientWith(["getLifePotionSlots", "onLifePotionSlotsUpdated"], (hub) => {
+      potionSlots.hub = hub;
+      hub.onLifePotionSlotsUpdated((slots) => { const s = normSlotList(slots); if (s) potionSlots.slots = s; });
+    });
+  }
+  function potionSlotsAsk() {
+    potionHubTap();
+    if (!potionSlots.hub) return;
+    const since = Date.now() - potionSlots.askedAt;
+    if (potionSlots.slots != null ? since < 60000 : since < 15000) return;
+    potionSlots.askedAt = Date.now();
+    try { Promise.resolve(potionSlots.hub.getLifePotionSlots()).then((d) => {
+      const s = normSlotList(d); if (s) potionSlots.slots = s;
+    }).catch(() => {}); } catch {}
+  }
+  function stepLifePotions(g, cb, now) {
+    const cur = cb ? null : g.currentActivity;
+    const active = cur && !isEnhancementActivity(cur);
+    if (!active) { lifePotions.act = null; lifePotions.potions = null; lifePotions.uses.clear(); return; }
+    if (lifePotions.act !== cur) { lifePotions.act = cur; lifePotions.potions = null; lifePotions.uses.clear(); }
+    potionSlotsAsk();
+    const slots = potionSlots.slots;
+    const watch = slots ? new Set(slots.map((s) => s.itemId)) : null;
+    const snap = new Map();
+    for (const it of g.inventory ?? []) {
+      const tracked = watch ? watch.has(it.itemId) : /^Potion/.test(it.category ?? "");
+      if (tracked && Number.isFinite(it.quantity)) snap.set(it.itemId, (snap.get(it.itemId) ?? 0) + it.quantity);
+    }
+    if (lifePotions.potions) for (const [id, prev] of lifePotions.potions)
+      if ((snap.get(id) ?? 0) === prev - 1) notePotionUse(id, g.inventory, now, lifePotions.uses);
+    lifePotions.potions = snap;
+  }
+  function lifePotionRows(g, now) {
+    if (!lifePotions.act) return [];
+    const inv = g.inventory ?? [], rows = [];
+    const qtyOf = (id) => lifePotions.potions?.get(id) ?? 0;
+    const nameOf = (id) => potionStat.get(id)?.name || inv.find((it) => it.itemId === id)?.name || `#${id}`;
+    const durOf = new Map((potionSlots.slots ?? []).filter((s) => s.effectDuration > 0).map((s) => [s.itemId, s.effectDuration]));
+    const rowOf = (id, interval, fresh) => {
+      const st = potionStat.get(id);
+      const iv = interval ?? durOf.get(id) ?? (st?.interval > 0 ? st.interval : LIFE_POTION_DEFAULT_SEC);
+      const qty = qtyOf(id), eta = qty * iv, est = fresh == null;
+      return { label: nameOf(id), value: qty <= 0 ? "已耗尽" : `余 ${qty} · 耗尽 ${fmtDur(eta)}${est ? "（估）" : ""}`,
+        accent: qty <= 0 || eta < potionLowMin * 60, accentColor: qty <= 0 ? "#f87171" : "#e8b45a" };
+    };
+    for (const [id, times] of lifePotions.uses) {
+      const fresh = times.length >= 2 && times.at(-1) > times[0] ? (times.at(-1) - times[0]) / (times.length - 1) / 1000 : null;
+      rows.push(rowOf(id, fresh, fresh));
+    }
+    for (const s of potionSlots.slots ?? []) {
+      if (lifePotions.uses.has(s.itemId) || qtyOf(s.itemId) <= 0) continue;
+      const started = s.startedAtMs != null ? Math.max(0, s.effectDuration - (now - s.startedAtMs) / 1000) : null;
+      const qty = qtyOf(s.itemId);
+      const eta = (started ?? s.effectDuration ?? LIFE_POTION_DEFAULT_SEC) + Math.max(0, qty - 1) * (s.effectDuration ?? LIFE_POTION_DEFAULT_SEC);
+      rows.push({ label: nameOf(s.itemId), value: `余 ${qty} · 耗尽 ≈ ${fmtDur(eta)}（估）`,
+        accent: eta < potionLowMin * 60, accentColor: "#e8b45a" });
+    }
+    return rows;
+  }
+
   const lodgeCalc = { hub: null, tried: false, state: null, rows: [] };
-  function lodgeTap() {
-    if (lodgeCalc.tried) return;
-    lodgeCalc.tried = true;
+  function hubClientWith(methods, use) {
     try {
       const url = [...new Set(performance.getEntriesByType("resource").map((e) => e.name))]
         .find((u) => /\/hubManager-[A-Za-z0-9_-]+\.js$/.test(u));
       if (!url) return;
       import(url).then((mod) => {
-        const hub = Object.values(mod).find((m) => m && typeof m.getLodgeState === "function" && typeof m.onLodgeState === "function");
-        if (!hub) return;
-        lodgeCalc.hub = hub;
-        hub.onLodgeState((state) => { lodgeCalc.state = state; renderLodgeGaps(); });
+        const hub = Object.values(mod).find((m) => m && methods.every((k) => typeof m[k] === "function"));
+        if (hub) use(hub);
       }).catch(() => {});
     } catch {}
+  }
+  function lodgeTap() {
+    if (lodgeCalc.tried) return;
+    lodgeCalc.tried = true;
+    hubClientWith(["getLodgeState", "onLodgeState"], (hub) => {
+      lodgeCalc.hub = hub;
+      hub.onLodgeState((state) => { lodgeCalc.state = state; renderLodgeGaps(); });
+    });
   }
   function lodgeAsk() {
     if (lodgeCalc.hub && !lodgeCalc.asked) { lodgeCalc.asked = true; try { lodgeCalc.hub.getLodgeState(); } catch {} }
@@ -400,11 +501,18 @@
     let pack = null;
     if (st) {
       const facility = document.querySelector(".lodge-content .block--facility")
-        ? [...document.querySelectorAll(".lodge-panel .side-card--facility.active use")]
-          .map((u) => (u.getAttribute("href") ?? "").match(/svg-icon:([A-Za-z]+)/)?.[1]).find(Boolean) : null;
+        ? [...document.querySelectorAll(".lodge-panel button.side-card--facility.active")]
+          .flatMap((c) => [...c.querySelectorAll("use")].map((u) => u.getAttribute("xlink:href") ?? u.getAttribute("href") ?? ""))
+          .map((h) => h.match(/(?:svg-icon:|#icon-)([A-Za-z]+)/i)?.[1]?.toLowerCase() ?? null)
+          .find(Boolean) : null;
+      const isFacility = (f) => {
+        if (!facility) return false;
+        const t = String(f.facilityType ?? "").toLowerCase().replace(/^lodge/, "");
+        return t === facility || (t && (t.includes(facility) || facility.includes(t)));
+      };
       if (!facility && st.nextLodgeUpgrade) pack = st.nextLodgeUpgrade;
       else for (const f of [...(st.facilities ?? []), ...(st.buildableFacilities ?? [])])
-        if (f.facilityType === facility && f.nextUpgrade) { pack = f.nextUpgrade; break; }
+        if (isFacility(f) && f.nextUpgrade) { pack = f.nextUpgrade; break; }
     }
     const gold = goldOf(getGameStore());
     const inv = new Map();
@@ -495,6 +603,7 @@
     const now = Date.now();
     const cb = combatOf(g);
     stepCombatRun(g, cb, now);
+    stepLifePotions(g, cb, now);
     const cs = String(g.connectionStatus ?? "").toLowerCase();
     let status = cs && cs !== "connected"
       ? `⚠ 连接: ${g.connectionStatus}`
@@ -540,6 +649,7 @@
       if (cb) rows.push({ label: "战斗", value: combatTitle(cb), accent: true });
       else if (!cur) rows.push({ label: "状态", value: "空闲" });
       if (cb) for (const row of combatMonitorRows()) rows.push(row);
+      else for (const row of lifePotionRows(g, now)) rows.push(row);
       parts.push({ title: "当前", rows });
     }
 
@@ -563,6 +673,7 @@
     const curSkill = (isEnhancementActivity(cur) || isAlchemyActivity(cur)) ? null
       : (cur ? (cur.skillType ?? cur.craftingProfession ?? null) : null);
     const inCombat = !!cb;
+    const directRate = !cb && cur ? gatherDirectRate(g, cur) : null;
     const upRows = [];
     for (const key of ["skills", "combatSkills"]) {
       for (const s of g[key] ?? []) {
@@ -573,23 +684,31 @@
         if (curSkill) { if (ty !== curSkill) continue; }
         else if (inCombat) { if (key !== "combatSkills") continue; }
         else continue;
+        const d = directRate && ty === directRate.ty ? directRate : null;
         const r = rateOf(k, now);
-        if (!r) {
+        const ser = series.get(k), lastAt = ser?.length ? ser[ser.length - 1].t : null;
+        const stale = lastAt != null && now - lastAt > RATE_FRESH_MS;
+        let xpSec = null, tag = "";
+        if (d && !stale) { xpSec = d.xpPerSec; tag = "，按次"; }
+        else if (r) { xpSec = r.xpPerSec; tag = stale ? "，估" : ""; }
+        if (xpSec == null) {
           if (curSkill && ty === curSkill)
             upRows.push({ label: `${zh(ty)} Lv.${s.level}（${s.experience}/${s.nextLevelExp}）`, value: "采样中…" });
           continue;
         }
-        const stale = now - r.lastChange > RATE_FRESH_MS;
         upRows.push({
-          label: `${zh(ty)} Lv.${s.level}（${(r.xpPerSec * 60).toFixed(1)} xp/分${stale ? "，估" : ""}）`,
-          value: fmtClock((s.nextLevelExp - s.experience) / r.xpPerSec),
+          label: `${zh(ty)} Lv.${s.level}（${(xpSec * 60).toFixed(1)} xp/分${tag}）`,
+          value: fmtClock((s.nextLevelExp - s.experience) / xpSec),
           accent: !stale, stale,
         });
       }
     }
     let skipSampled = false;
     if (craftCtx) {
-      const cx = craftXp.get(cur.craftingProfession);
+      const cs = g?.craftingSkillLevels?.[cur.craftingProfession];
+      const cx = cs && Number.isFinite(cs.experience) && Number.isFinite(cs.nextLevelExp)
+        ? { prof: cur.craftingProfession, lv: cs.level ?? null, xp: cs.experience, next: cs.nextLevelExp, at: now }
+        : craftXp.get(cur.craftingProfession);
       const rows = [];
       if (cx) {
         const crafts = Math.max(0, Math.ceil((cx.next - cx.xp) / craftCtx.r.xpPerCraft));
@@ -615,6 +734,19 @@
           value: "≈ " + fmtClock(craftCtx.eta), accent: !craftCtx.short });
       parts.push({ title: "生产预估", rows });
       skipSampled = true;
+    }
+    if (!cb && isAlchemyActivity(cur)) {
+      const ax = craftXp.get("Alchemy");
+      if (ax && Number.isFinite(ax.next) && ax.next > 0) {
+        const ready = ax.per > 0 && ax.tick > 0;
+        const staleA = ready && now - ax.at > RATE_FRESH_MS;
+        upRows.push(ready ? {
+          label: `炼金 Lv.${ax.lv ?? "?"}（${(ax.per / ax.tick * 60).toFixed(1)} xp/分${staleA ? "，估" : ""}）`,
+          value: fmtClock((ax.next - ax.xp) / (ax.per / ax.tick)), accent: !staleA, stale: staleA,
+        } : {
+          label: `炼金 Lv.${ax.lv ?? "?"}（${ax.xp}/${ax.next}）`, value: "采样中…", stale: true,
+        });
+      }
     }
     upRows.sort((a, b) => a.label.localeCompare(b.label));
     if (!skipSampled && upRows.length) parts.push({ title: "升级预估", rows: upRows });
@@ -905,6 +1037,47 @@
         if (Number.isFinite(n)) render(Math.min(LIFE_XP_CUM.length, Math.max(si.lv + 1, n)));
       });
       render(si.lv + 1);
+      if ((recipe || isGather) && Number.isFinite(si.t) && si.t > 0) {
+        const countEl = document.createElement("div");
+        countEl.className = "fh-count-rows";
+        rowsEl.parentNode.insertBefore(countEl, rowsEl.nextSibling);
+        const invMap = new Map((g?.inventory ?? []).map((it2) => [it2.itemId, it2.quantity ?? 0]));
+        const possible = recipe && (recipe.ingredients ?? []).length
+          ? Math.min(...recipe.ingredients.map((i) => Math.floor((invMap.get(i.itemId) ?? 0) / (i.quantity || 1))))
+          : Infinity;
+        const perHour = Math.round(3600 / si.t);
+        const outName = isGather ? (resource?.name ?? itemName) : null;
+        const drop = new RegExp((resource?.name ?? itemName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\s+库存\\s*\\d+\\s*×(\\d+)(?:–(\\d+))?\\s*(\\d+)%").exec(text);
+        const yMin = drop ? +drop[1] : 1, yMax = drop ? (+drop[2] ?? +drop[1]) : 1, dropRate = drop ? +drop[3] / 100 : 1;
+        const repeatInp = dlg.querySelector('input[aria-label="重复次数"]');
+        const renderCount = () => {
+          const raw = (repeatInp?.value ?? "").trim();
+          const cnt = raw === "∞" || raw.toUpperCase() === "MAX" ? Infinity
+            : Number.isFinite(+raw) && +raw > 0 ? Math.floor(+raw) : null;
+          if (cnt == null) { countEl.innerHTML = ""; return; }
+          const can = Math.min(cnt, possible);
+          const yieldTxt = (n) => {
+            const outs = [];
+            if (outName) {
+              const lo = Math.round(n * yMin * dropRate), hi = Math.round(n * yMax * dropRate);
+              outs.push(`${outName} ×${lo === hi ? fmtCompact(lo) : fmtCompact(lo) + "–" + fmtCompact(hi)}`);
+            }
+            if (si.per) outs.push(`+${fmtCompact(n * si.per)} xp`);
+            return outs.length ? ` · ${outs.join(" · ")}` : "";
+          };
+          const rows = [cnt === Infinity
+            ? { label: "本次 ∞ 次", value: recipe ? "料尽为止" : "∞", accent: true }
+            : { label: `本次 ${fmtCompact(cnt)} 次`,
+                value: (can < cnt ? `缺料（仅够 ${fmtCompact(can)} 次）` : "≈ " + fmtClock(can * si.t)) + yieldTxt(can), accent: true }];
+          rows.push({ label: "每小时", value: `≈${perHour} ${isGather ? "次" : "件"}${yieldTxt(perHour)}` });
+          countEl.innerHTML = rows.map((r) => dlgRow(r.label, r.value, r.accent)).join("");
+        };
+        renderCount();
+        if (dlg._fhCount) { dlg.removeEventListener("input", dlg._fhCount); dlg.removeEventListener("click", dlg._fhCount); }
+        dlg._fhCount = renderCount;
+        dlg.addEventListener("input", renderCount);
+        dlg.addEventListener("click", renderCount);
+      }
     }
     if (modules.fav && (recipe || resource)) {
       const favBtn = document.createElement("button");
@@ -930,12 +1103,179 @@
     }
     target.parentNode.insertBefore(host, target);
   }
+
+  function parseAlchCard(card) {
+    const t = (card.innerText ?? "").replace(/\s+/g, " ");
+    const sec = parseFloat((t.match(/时间 ([\d.]+)s/) ?? [])[1]);
+    if (!Number.isFinite(sec) || sec <= 0) return null;
+    const countRaw = card.querySelector(".queue-input")?.value?.trim() ?? "";
+    const returns = [];
+    const seg = t.match(/预计返还 (.*?) 重复次数/);
+    if (seg) for (const m of seg[1].matchAll(/(?:T\d+ )?([^\s]+?) ×([\d.]+)/g))
+      returns.push({ name: m[1], qty: parseFloat(m[2]) });
+    return {
+      sec,
+      count: countRaw === "∞" ? Infinity : Number.isFinite(+countRaw) && +countRaw > 0 ? Math.floor(+countRaw) : null,
+      xp: parseFloat((t.match(/经验 \+(\d+)/) ?? [])[1]),
+      rate: parseFloat((t.match(/成功率 ([\d.]+)%/) ?? [])[1]),
+      gain: parseFloat((t.match(/收益 \+(\d+) 金币/) ?? [])[1]),
+      cost: parseFloat((t.match(/成本 (\d+) 金币/) ?? [])[1]),
+      crit: /暴击 ([\d.]+)% · \+(\d+) 金币/.exec(t),
+      returns,
+    };
+  }
+  function alchCardRows(p) {
+    const oph = 3600 / p.sec;
+    const parts = [`${oph >= 100 ? Math.round(oph) : oph.toFixed(1)} 次/时`];
+    if (Number.isFinite(p.xp)) parts.push(`经验 +${fmtCompact(oph * p.xp)}/时`);
+    let gold = null;
+    if (Number.isFinite(p.gain)) {
+      const pct = p.crit ? parseFloat(p.crit[1]) : 0, cg = p.crit ? parseFloat(p.crit[2]) : 0;
+      gold = (p.rate ?? 100) / 100 * ((1 - pct / 100) * p.gain + pct / 100 * cg);
+    } else if (Number.isFinite(p.cost)) gold = -p.cost;
+    if (gold != null) parts.push(`金币 ${gold >= 0 ? "+" : "−"}${fmtCompact(Math.abs(oph * gold))}/时`);
+    for (const r of p.returns) parts.push(`${r.name} +${fmtCompact(oph * r.qty)}/时`);
+    const rows = [];
+    if (Number.isFinite(p.count)) rows.push({ label: `本次 ${fmtCompact(p.count)} 次`, value: "≈ " + fmtClock(p.count * p.sec), accent: true });
+    rows.push({ label: "每小时", value: parts.join(" · ") });
+    return rows;
+  }
+  const FH_ALCH_ID = "fh-alch-info";
+  function enhanceAlchCard() {
+    if (!modules.dialog) { document.getElementById(FH_ALCH_ID)?.remove(); return; }
+    const card = document.querySelector(".alch-card");
+    const anchor = card?.querySelector(".queue-input-row");
+    if (!card || !anchor) { document.getElementById(FH_ALCH_ID)?.remove(); return; }
+    let host = document.getElementById(FH_ALCH_ID);
+    if (!host || host.nextElementSibling !== anchor) {
+      host?.remove();
+      host = document.createElement("div");
+      host.id = FH_ALCH_ID;
+      anchor.parentNode.insertBefore(host, anchor);
+    }
+    const p = parseAlchCard(card);
+    const rows = p ? alchCardRows(p) : [];
+    const html = rows.map((r) => fhRow(r.label, r.value, r)).join("");
+    if (host.dataset.h !== html) { host.innerHTML = `<div class="fh-rows">${html}</div>`; host.dataset.h = html; }
+    const inp = card.querySelector(".queue-input");
+    if (inp && inp._fhHook !== enhanceAlchCard) {
+      inp._fhHook = enhanceAlchCard;
+      inp.addEventListener("input", () => enhanceAlchCard());
+    }
+    if (card._fhHook !== enhanceAlchCard) {
+      card._fhHook = enhanceAlchCard;
+      card.addEventListener("click", () => enhanceAlchCard());
+    }
+  }
+
+  const ENH_UNLOCK = [1, 10, 20, 35, 50, 65, 80], ENH_TIER_COST = [1, 2.2, 4.2, 7.5, 13, 21, 33, 50];
+  function enhRate(target, skill, tier, catalyst) {
+    const unlock = ENH_UNLOCK[Math.min(7, Math.max(1, tier)) - 1] ?? 80;
+    const span = 200 - unlock;
+    const w = skill < unlock ? 0
+      : span <= 0 ? 1
+      : (() => { const i = Math.min(1, Math.max(0, (skill - unlock) / span));
+          const a = Math.min(1, Math.max(0, (Math.min(200, Math.max(unlock, 100)) - unlock) / span));
+          return a + (1 - a) * i; })();
+    const t = Math.min(20, Math.max(1, target));
+    const n = 2 + 4 * w, decay = Math.max(0, 0.18 - 0.06 * w), x = Math.max(0, t - n);
+    const base = t <= 10
+      ? (x <= 0 ? 1 : Math.exp(-decay * x ** 1.55))
+      : (() => { const x10 = Math.max(0, 10 - n); return (x10 <= 0 ? 1 : Math.exp(-decay * x10 ** 1.55)) * 0.45 ** (t - 10); })();
+    const rate = base * (skill >= unlock ? 1 : Math.max(0.01, (skill / unlock) ** 3));
+    return Math.min(1, Math.max(0, catalyst ? rate * 1.25 : rate));
+  }
+  function enhGold(target, tier, dagger) {
+    const a = ENH_TIER_COST[Math.min(8, Math.max(1, tier)) - 1] ?? 1;
+    const t = Math.min(20, Math.max(1, target));
+    const s = Math.round(40 * a * (1 + 0.1 * (t - 1) / 19));
+    return dagger ? Math.max(1, Math.round(s * 0.75)) : s;
+  }
+  function enhWalk(cur, target, skill, tier, dagger, xpPer, catalyst, catMin) {
+    let ePrev = 1, attempts = 0, gold = 0;
+    for (let plus = 1; plus <= target; plus++) {
+      const p = Math.max(0.01, enhRate(plus, skill, tier, catalyst && (!catMin || plus >= catMin)));
+      const e = plus === 1 ? 1 / p : (1 + (1 - p) * ePrev) / p;
+      ePrev = e;
+      if (plus > cur) { attempts += e; gold += e * enhGold(plus, tier, dagger); }
+    }
+    return { attempts, gold, xp: attempts * xpPer };
+  }
+  function enhTickEst(g, itemId) {
+    const it = (g?.inventory ?? []).find((i) => i.itemId === itemId);
+    const tier = Math.min(7, Math.max(1, it?.tier ?? 1));
+    const lv = g?.craftingSkillLevels?.Enhancement?.level ?? 1;
+    const hammer = (g?.equippedCraftingTools ?? []).find((t) => t.profession === "Enhancement")?.toolTier ?? 0;
+    return gatherInterval(tier, lv, hammer) * (/Dagger/i.test(it?.category ?? "") ? 0.75 : 1);
+  }
+  const enhPreview = { last: null };
+  const FH_ENH_ID = "fh-enh-info";
+  function enhanceEnhCard() {
+    if (!modules.dialog) { document.getElementById(FH_ENH_ID)?.remove(); return; }
+    const card = document.querySelector(".enh-card");
+    const anchor = card?.querySelector(".enh-actions");
+    if (!card || !anchor) { document.getElementById(FH_ENH_ID)?.remove(); return; }
+    enhPreviewTap();
+    let host = document.getElementById(FH_ENH_ID);
+    if (!host || host.nextElementSibling !== anchor) {
+      host?.remove();
+      host = document.createElement("div");
+      host.id = FH_ENH_ID;
+      anchor.parentNode.insertBefore(host, anchor);
+    }
+    const draw = (rows) => {
+      const html = rows.map((r) => fhRow(r.label, r.value, r)).join("");
+      if (host.dataset.h !== html) { host.innerHTML = html ? `<div class="fh-rows">${html}</div>` : ""; host.dataset.h = html; }
+    };
+    const t = (card.innerText ?? "").replace(/\s+/g, " ");
+    const cur = parseInt((t.match(/当前\+(\d+)/) ?? [])[1] ?? "0", 10) || 0;
+    const target = parseInt(card.querySelector(".level-input")?.value ?? "", 10);
+    const sel = enhPreview.last;
+    if (!sel?.itemId || !Number.isFinite(target) || target <= cur || cur >= 20) { draw([]); return; }
+    const g = getGameStore();
+    const it = (g?.inventory ?? []).find((i) => i.itemId === sel.itemId);
+    const tier = Math.min(7, Math.max(1, it?.tier ?? 1));
+    const skill = g?.craftingSkillLevels?.Enhancement?.level ?? 1;
+    const dagger = /Dagger/i.test(it?.category ?? "");
+    const xpPer = sel.r?.xpGain > 0 ? sel.r.xpGain : [10, 22, 42, 75, 130, 210, 330][tier - 1];
+    const catMin = sel.r?.catalystMinTarget > 0 ? sel.r.catalystMinTarget : null;
+    const w = enhWalk(cur, target, skill, tier, dagger, xpPer, sel.catalyst, catMin);
+    const time = w.attempts * enhTickEst(g, sel.itemId);
+    draw([
+      { label: `强化到 +${target} 期望`, value: `${Math.round(w.attempts)} 次`, accent: true },
+      { label: "期望金币", value: `−${fmtCompact(w.gold)}` },
+      { label: "期望时间", value: "≈ " + fmtClock(time) + "（估）" },
+      { label: "每小时", value: `经验 +${fmtCompact(w.xp / time * 3600)} · 金币 −${fmtCompact(w.gold / time * 3600)}` },
+    ]);
+    if (card._fhHook !== enhanceEnhCard) {
+      card._fhHook = enhanceEnhCard;
+      card.addEventListener("input", () => enhanceEnhCard());
+      card.addEventListener("change", () => enhanceEnhCard());
+      card.addEventListener("click", () => enhanceEnhCard());
+    }
+  }
+  function enhPreviewTap() {
+    if (enhPreview.tapped) return;
+    enhPreview.tapped = true;
+    hubClientWith(["getEnhancementPreview"], (hub) => {
+      const orig = hub.getEnhancementPreview;
+      hub.getEnhancementPreview = function (...args) {
+        const p = Promise.resolve(orig.apply(this, args));
+        p.then((r) => { try {
+          if (r && Number.isFinite(args[0])) enhPreview.last = { itemId: args[0], catalyst: !!args[2], r };
+        } catch {} }).catch(() => {});
+        return p;
+      };
+    });
+  }
   const inHudTree = (n) => n === root || root.contains(n)
     || (favPage?.contains(n) ?? false) || (calcPage?.contains(n) ?? false);
   let navInstallAt = 0;
   const hudObserver = new MutationObserver((muts) => {
     if (muts.every((mu) => inHudTree(mu.target))) return;
     try { enhanceStartDialog(); } catch {}
+    try { enhanceAlchCard(); } catch {}
+    try { enhanceEnhCard(); } catch {}
     const now = Date.now();
     if (now - navInstallAt >= 250) {
       navInstallAt = now;
